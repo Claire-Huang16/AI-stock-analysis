@@ -17,30 +17,21 @@ st.set_page_config(
     initial_sidebar_state="expanded"
 )
 
-# --- 嘗試直接把側邊欄內容放在這裡，不要包在任何 function 內 ---
-with st.sidebar:
-    st.header("系統設定")
-    market_type = st.selectbox("選擇市場", ["美股", "台股"])
-    stock_code = st.text_input("輸入股票代碼")
-    # ... 其他欄位
-
-# 加入自訂 CSS 讓 UI 在平板上更像原生 App
-st.markdown("""
+st.markdown(
+    """
     <style>
-    /* 隱藏 Streamlit 頂部裝飾條 */
-    #MainMenu {visibility: hidden;}
-    footer {visibility: hidden;}
-    header {visibility: hidden;}
-    
-    /* 讓按鈕在觸控螢幕上更好點擊 */
-    .stButton>button {
-        width: 100%;
-        height: 3em;
-        border-radius: 10px;
+    /* 強制顯示側邊欄按鈕，並將其放大、變色，方便 iPad 點擊 */
+    [data-testid="collapsedControl"] {
+        color: white;
+        background-color: #ff4b4b; /* 變成紅色，讓你一定看得到 */
+        border-radius: 50%;
+        left: 10px;
+        top: 10px;
     }
     </style>
-    """, unsafe_allow_html=True)
-
+    """,
+    unsafe_allow_html=True
+)
 
 # 主標題
 st.title("📈 AI 股票趨勢分析系統")
