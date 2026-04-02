@@ -7,16 +7,22 @@ from openai import OpenAI
 from datetime import datetime, timedelta
 import json
 import numpy as np
+import streamlit as st
+# ... 其他 import
 
-
-# 找到這段程式碼並修改 initial_sidebar_state
 st.set_page_config(
     page_title="AI 股票趨勢分析系統",
     page_icon="📈",
     layout="wide",
-    initial_sidebar_state="expanded"  # 將這裡改為 "expanded"
+    initial_sidebar_state="expanded"
 )
-)
+
+# --- 嘗試直接把側邊欄內容放在這裡，不要包在任何 function 內 ---
+with st.sidebar:
+    st.header("系統設定")
+    market_type = st.selectbox("選擇市場", ["美股", "台股"])
+    stock_code = st.text_input("輸入股票代碼")
+    # ... 其他欄位
 
 # 加入自訂 CSS 讓 UI 在平板上更像原生 App
 st.markdown("""
