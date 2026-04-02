@@ -7,14 +7,13 @@ from openai import OpenAI
 from datetime import datetime, timedelta
 import json
 import numpy as np
-import streamlit as st
-# ... 其他 import
 
+# 設置頁面配置
 st.set_page_config(
     page_title="AI 股票趨勢分析系統",
     page_icon="📈",
     layout="wide",
-    initial_sidebar_state="expanded"
+    initial_sidebar_state="expanded"  # 將這裡改為 "expanded"
 )
 
 st.markdown(
@@ -349,6 +348,157 @@ def get_tw_financial_statements(symbol, api_key):
         pass
 
     return result
+
+
+# ─────────────────────────────────────────────
+# 內部人買賣 / 法人目標價 / P/E P/S 函數（FMP API，美股）
+# ─────────────────────────────────────────────
+
+def get_insider_trading(symbol, api_key):
+    """
+    從 FMP API 獲取美股內部人買賣紀錄（近3個月）
+    靜默失敗，返回 None
+
+    Returns:
+        DataFrame or None
+    """
+    try:
+        url = f"https://financialmodelingprep.com/stable/insider-trading"
+        params = {'symbol': symbol, 'apikey': api_key, 'limit': 50}
+        resp = requests.get(url, params=params, timeout=20)
+        resp.raise_for_status()
+        data = resp.json()
+        if not data or not isinstance(data, list):
+            return None
+        df = pd.DataFrame(data)
+        # 保留重要欄位（容錯各版本欄位名）
+        keep = [c for c in ['transactionDate', 'reportingName', 'transactionType',
+                             'securitiesTransacted', 'price', 'securitiesOwned',
+                             'typeOfOwner'] if c in df.columns]
+        if not keep:
+            return None
+        df = df[keep].copy()
+        df['transactionDate'] = pd.to_datetime(df['transactionDate'], errors='coerce')
+        df = df.dropna(subset=['transactionDate'])
+        df = df.sort_values('transactionDate', ascending=False).reset_index(drop=True)
+        # 只取近3個月
+        cutoff = datetime.now() - timedelta(days=90)
+        df = df[df['transactionDate'] >= cutoff]
+        return df if len(df) > 0 else None
+    except Exception:
+        return None
+
+
+def get_analyst_targets(symbol, api_key):
+    """
+    從 FMP API 獲取美股分析師目標價與評級
+    靜默失敗，返回 None
+
+    Returns:
+        dict: { 'targets': DataFrame, 'consensus': dict } or None
+    """
+    result = {'targets': None, 'consensus': None}
+    try:
+        # 目標價列表
+        url = f"https://financialmodelingprep.com/stable/price-target"
+        params = {'symbol': symbol, 'apikey': api_key, 'limit': 20}
+        resp = requests.get(url, params=params, timeout=20)
+        resp.raise_for_status()
+        data = resp.json()
+        if data and isinstance(data, list):
+            df = pd.DataFrame(data)
+            keep = [c for c in ['publishedDate', 'analystCompany', 'analystName',
+                                 'priceTarget', 'priceWhenPosted', 'newsTitle'] if c in df.columns]
+            if keep:
+                df = df[keep].copy()
+                df['publishedDate'] = pd.to_datetime(df['publishedDate'], errors='coerce')
+                df = df.sort_values('publishedDate', ascending=False).head(20)
+                result['targets'] = df
+    except Exception:
+        pass
+
+    try:
+        # 共識評級
+        url2 = f"https://financialmodelingprep.com/stable/price-target-consensus"
+        params2 = {'symbol': symbol, 'apikey': api_key}
+        resp2 = requests.get(url2, params=params2, timeout=20)
+        resp2.raise_for_status()
+        data2 = resp2.json()
+        if data2 and isinstance(data2, list) and len(data2) > 0:
+            result['consensus'] = data2[0]
+        elif data2 and isinstance(data2, dict):
+            result['consensus'] = data2
+    except Exception:
+        pass
+
+    return result if (result['targets'] is not None or result['consensus'] is not None) else None
+
+
+def get_pe_ps_history(symbol, api_key):
+    """
+    從 FMP API 獲取美股歷年 P/E、P/S 及年度股價（用於歷年比較圖）
+    靜默失敗，返回 None
+
+    Returns:
+        dict: { 'ratios': DataFrame } or None
+    """
+    try:
+        # 年度財務比率（含 P/E、P/S）
+        url = f"https://financialmodelingprep.com/stable/ratios"
+        params = {'symbol': symbol, 'apikey': api_key, 'period': 'annual', 'limit': 8}
+        resp = requests.get(url, params=params, timeout=20)
+        resp.raise_for_status()
+        data = resp.json()
+        if not data or not isinstance(data, list):
+            return None
+        df = pd.DataFrame(data)
+        keep = [c for c in ['date', 'priceEarningsRatio', 'priceToSalesRatio',
+                             'priceToBookRatio', 'dividendYield'] if c in df.columns]
+        if 'date' not in df.columns:
+            return None
+        df = df[keep].copy()
+        df['date'] = pd.to_datetime(df['date'], errors='coerce')
+        df = df.dropna(subset=['date']).sort_values('date').reset_index(drop=True)
+        for col in keep:
+            if col != 'date':
+                df[col] = pd.to_numeric(df[col], errors='coerce')
+        return {'ratios': df}
+    except Exception:
+        return None
+
+
+def get_tw_pe_ps_history(symbol, api_key):
+    """
+    從 FinMind API 獲取台股本益比（P/E）歷史資料
+    靜默失敗，返回 None
+
+    Returns:
+        dict: { 'ratios': DataFrame } or None
+    """
+    try:
+        url = "https://api.finmindtrade.com/api/v4/data"
+        params = {
+            'dataset': 'TaiwanStockPER',
+            'data_id': symbol,
+            'start_date': (datetime.now() - timedelta(days=365 * 5)).strftime('%Y-%m-%d'),
+            'token': api_key
+        }
+        resp = requests.get(url, params=params, timeout=20)
+        resp.raise_for_status()
+        result = resp.json()
+        if result.get('status') != 200 or not result.get('data'):
+            return None
+        df = pd.DataFrame(result['data'])
+        if 'date' not in df.columns:
+            return None
+        df['date'] = pd.to_datetime(df['date'])
+        for col in ['PER', 'PBR', 'dividend_yield']:
+            if col in df.columns:
+                df[col] = pd.to_numeric(df[col], errors='coerce')
+        df = df.sort_values('date').reset_index(drop=True)
+        return {'ratios': df}
+    except Exception:
+        return None
 
 
 # ─────────────────────────────────────────────
@@ -911,6 +1061,41 @@ def create_candlestick_chart(df, symbol, rsi_period, currency_symbol, institutio
 
     return fig
 
+def create_macd_chart(df, symbol):
+    """
+    創建 MACD 獨立圖表
+    """
+    if 'MACD_DIF' not in df.columns or 'MACD_LINE' not in df.columns:
+        return None
+        
+    fig = make_subplots(rows=1, cols=1)
+    
+    # DIF 線
+    fig.add_trace(
+        go.Scatter(x=df['date'], y=df['MACD_DIF'], mode='lines', name='DIF', line=dict(color='#1e90ff', width=1.5)),
+        row=1, col=1
+    )
+    # MACD (Signal) 線
+    fig.add_trace(
+        go.Scatter(x=df['date'], y=df['MACD_LINE'], mode='lines', name='MACD', line=dict(color='#f39c12', width=1.5)),
+        row=1, col=1
+    )
+    # 柱狀圖 (Histogram)
+    colors = ['#ff4757' if v >= 0 else '#2ed573' for v in df['MACD_HIST']]
+    fig.add_trace(
+        go.Bar(x=df['date'], y=df['MACD_HIST'], name='Histogram', marker_color=colors, opacity=0.7),
+        row=1, col=1
+    )
+    
+    fig.update_layout(
+        title=f'{symbol} MACD 指標',
+        height=300,
+        template='plotly_white',
+        showlegend=True,
+        margin=dict(t=50, b=20, l=50, r=50)
+    )
+    return fig
+
 
 def create_margin_chart(margin_df, symbol):
     """
@@ -962,7 +1147,193 @@ def create_margin_chart(margin_df, symbol):
     return fig
 
 
-def create_macd_chart(df, symbol):
+def create_insider_chart(insider_df, symbol):
+    """
+    創建內部人買賣圖：橫條圖，買進綠色／賣出紅色，X軸為股數
+    """
+    if insider_df is None or len(insider_df) == 0:
+        return None
+    try:
+        df = insider_df.head(20).copy()
+        # 判斷買/賣
+        type_col = 'transactionType' if 'transactionType' in df.columns else None
+        if type_col:
+            df['is_buy'] = df[type_col].str.contains('Buy|Purchase|Acquisition', case=False, na=False)
+        else:
+            df['is_buy'] = True
+
+        df['shares'] = pd.to_numeric(df.get('securitiesTransacted', 0), errors='coerce').fillna(0)
+        df['signed_shares'] = df.apply(lambda r: r['shares'] if r['is_buy'] else -r['shares'], axis=1)
+        df['label'] = df.apply(lambda r: (
+            r.get('reportingName', '未知')[:18] + '  ' +
+            r['transactionDate'].strftime('%m/%d') if pd.notna(r['transactionDate']) else ''
+        ), axis=1)
+        df['color'] = df['is_buy'].map({True: '#2ecc71', False: '#e74c3c'})
+        df = df.sort_values('transactionDate', ascending=True)
+
+        fig = go.Figure(go.Bar(
+            x=df['signed_shares'],
+            y=df['label'],
+            orientation='h',
+            marker_color=df['color'],
+            text=df.apply(lambda r: f"{'買進' if r['is_buy'] else '賣出'} {abs(r['shares']):,.0f}股", axis=1),
+            textposition='outside',
+            hovertemplate='%{y}<br>%{x:,.0f} 股<extra></extra>'
+        ))
+        fig.update_layout(
+            title=f'{symbol} 內部人買賣（近3個月，正值=買進，負值=賣出）',
+            height=max(350, len(df) * 28 + 120),
+            template='plotly_white',
+            xaxis_title='交易股數',
+            xaxis=dict(tickformat=','),
+            margin=dict(l=200)
+        )
+        fig.add_vline(x=0, line_dash='dash', line_color='gray', line_width=1)
+        return fig
+    except Exception:
+        return None
+
+
+def create_analyst_chart(analyst_data, symbol, currency_symbol, current_price):
+    """
+    創建法人目標價分布圖：散點圖顯示各機構目標價，加入現價水平線
+    """
+    if analyst_data is None:
+        return None
+    targets_df = analyst_data.get('targets')
+    consensus  = analyst_data.get('consensus')
+    if targets_df is None or len(targets_df) == 0:
+        return None
+    try:
+        df = targets_df.copy()
+        df['priceTarget'] = pd.to_numeric(df['priceTarget'], errors='coerce')
+        df = df.dropna(subset=['priceTarget'])
+        if len(df) == 0:
+            return None
+
+        df['label'] = df.apply(lambda r: (
+            r.get('analystCompany', '未知')[:20] + ' ' +
+            (r['publishedDate'].strftime('%Y/%m/%d') if pd.notna(r['publishedDate']) else '')
+        ), axis=1)
+
+        fig = go.Figure()
+
+        # 目標價散點
+        fig.add_trace(go.Scatter(
+            x=df['publishedDate'],
+            y=df['priceTarget'],
+            mode='markers+text',
+            marker=dict(size=10, color='#3498db',
+                        symbol='diamond',
+                        line=dict(color='white', width=1)),
+            text=df['label'],
+            textposition='top center',
+            name='目標價',
+            hovertemplate='%{text}<br>目標價：' + currency_symbol + '%{y:.2f}<extra></extra>'
+        ))
+
+        # 現價水平線
+        fig.add_hline(y=current_price, line_dash='dash', line_color='#e74c3c',
+                      annotation_text=f'現價 {currency_symbol}{current_price:.2f}',
+                      annotation_position='right')
+
+        # 共識目標價（若有）
+        if consensus:
+            target_mean = consensus.get('targetConsensus') or consensus.get('targetMean') or consensus.get('priceTarget')
+            if target_mean:
+                target_mean = float(target_mean)
+                fig.add_hline(y=target_mean, line_dash='dot', line_color='#f39c12',
+                              annotation_text=f'共識目標 {currency_symbol}{target_mean:.2f}',
+                              annotation_position='left')
+
+        # 計算平均目標價
+        avg_target = df['priceTarget'].mean()
+        upside = ((avg_target - current_price) / current_price * 100) if current_price > 0 else 0
+        title_extra = f'  |  平均目標 {currency_symbol}{avg_target:.2f}（{upside:+.1f}%）'
+
+        fig.update_layout(
+            title=f'{symbol} 法人目標價分布' + title_extra,
+            height=450,
+            template='plotly_white',
+            yaxis_title=f'目標價（{currency_symbol}）',
+            showlegend=False
+        )
+        return fig
+    except Exception:
+        return None
+
+
+def create_pe_ps_chart(pe_data, symbol, price_df):
+    """
+    創建 P/E 與 P/S（或 P/B）歷年比較圖（雙Y軸：左=比率，右=股價）
+    pe_data: {'ratios': DataFrame}
+    price_df: 股價 DataFrame（含 date, close）
+    """
+    if pe_data is None or pe_data.get('ratios') is None:
+        return None
+    try:
+        ratios = pe_data['ratios']
+
+        # 偵測可用欄位
+        pe_col = next((c for c in ['PER', 'priceEarningsRatio'] if c in ratios.columns), None)
+        ps_col = next((c for c in ['priceToSalesRatio'] if c in ratios.columns), None)
+        pb_col = next((c for c in ['PBR', 'priceToBookRatio'] if c in ratios.columns), None)
+
+        if pe_col is None and ps_col is None and pb_col is None:
+            return None
+
+        fig = make_subplots(specs=[[{"secondary_y": True}]])
+
+        # 左Y軸：P/E
+        if pe_col and ratios[pe_col].notna().sum() > 1:
+            fig.add_trace(go.Scatter(
+                x=ratios['date'], y=ratios[pe_col],
+                mode='lines+markers', name='P/E 本益比',
+                line=dict(color='#e74c3c', width=2),
+                marker=dict(size=6)
+            ), secondary_y=False)
+
+        # 左Y軸：P/S
+        if ps_col and ratios[ps_col].notna().sum() > 1:
+            fig.add_trace(go.Scatter(
+                x=ratios['date'], y=ratios[ps_col],
+                mode='lines+markers', name='P/S 股價銷售比',
+                line=dict(color='#9b59b6', width=2, dash='dash'),
+                marker=dict(size=6)
+            ), secondary_y=False)
+
+        # 左Y軸：P/B
+        if pb_col and ratios[pb_col].notna().sum() > 1:
+            fig.add_trace(go.Scatter(
+                x=ratios['date'], y=ratios[pb_col],
+                mode='lines+markers', name='P/B 股價淨值比',
+                line=dict(color='#27ae60', width=2, dash='dot'),
+                marker=dict(size=6)
+            ), secondary_y=False)
+
+        # 右Y軸：股價走勢（年度均價）
+        if price_df is not None and len(price_df) > 0:
+            price_copy = price_df.copy()
+            price_copy['year'] = price_copy['date'].dt.year
+            yearly_close = price_copy.groupby('year')['close'].mean().reset_index()
+            yearly_close['date'] = pd.to_datetime(yearly_close['year'].astype(str) + '-06-30')
+            fig.add_trace(go.Bar(
+                x=yearly_close['date'], y=yearly_close['close'],
+                name='年均股價', opacity=0.25,
+                marker_color='#3498db'
+            ), secondary_y=True)
+
+        fig.update_layout(
+            title=f'{symbol} P/E、P/S 歷年比較（左軸=估值比率，右軸=年均股價）',
+            height=450,
+            template='plotly_white',
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
+        )
+        fig.update_yaxes(title_text="估值比率（倍）", secondary_y=False)
+        fig.update_yaxes(title_text="年均股價", secondary_y=True)
+        return fig
+    except Exception:
+        return None
     """
     創建 MACD 指標圖（2層子圖：DIF+MACD線 / 柱狀圖 HIST）
 
@@ -1028,7 +1399,9 @@ def create_macd_chart(df, symbol):
 
 def create_bb_obv_chart(df, symbol, currency_symbol='$'):
     """
-    創建布林通道 + OBV 雙層圖（上層BB+K線，下層OBV）
+    創建布林通道 + OBV 雙層圖
+    上層：BB 三軌 + K線柱狀圖（Candlestick）+ 壓縮期底色
+    下層：OBV 量能指標
 
     Returns:
         plotly Figure or None
@@ -1039,7 +1412,7 @@ def create_bb_obv_chart(df, symbol, currency_symbol='$'):
     has_obv = 'OBV' in df.columns
     rows = 2 if has_obv else 1
     row_heights = [0.65, 0.35] if has_obv else [1.0]
-    subplot_titles = ('布林通道 + 收盤價', 'OBV 量能指標') if has_obv else ('布林通道 + 收盤價',)
+    subplot_titles = ('布林通道 + K線圖', 'OBV 量能指標') if has_obv else ('布林通道 + K線圖',)
 
     fig = make_subplots(
         rows=rows, cols=1,
@@ -1049,22 +1422,25 @@ def create_bb_obv_chart(df, symbol, currency_symbol='$'):
         row_heights=row_heights
     )
 
-    # 上軌/下軌填色區域
-    fig.add_trace(go.Scatter(
-        x=pd.concat([df['date'], df['date'][::-1]]),
-        y=pd.concat([df['BB_UPPER'], df['BB_LOWER'][::-1]]),
-        fill='toself',
-        fillcolor='rgba(100,149,237,0.08)',
-        line=dict(color='rgba(255,255,255,0)'),
-        showlegend=False, name='BB 通道'
-    ), row=1, col=1)
+    # ── 上下軌填色區域（先繪，讓 K 線疊在上面）──
+    if 'BB_UPPER' in df.columns and 'BB_LOWER' in df.columns:
+        fig.add_trace(go.Scatter(
+            x=pd.concat([df['date'], df['date'][::-1]]),
+            y=pd.concat([df['BB_UPPER'], df['BB_LOWER'][::-1]]),
+            fill='toself',
+            fillcolor='rgba(100,149,237,0.08)',
+            line=dict(color='rgba(255,255,255,0)'),
+            showlegend=False, name='BB 通道填色',
+            hoverinfo='skip'
+        ), row=1, col=1)
 
-    # BB 上軌 / 中軌 / 下軌
-    fig.add_trace(go.Scatter(
-        x=df['date'], y=df['BB_UPPER'],
-        mode='lines', name='BB 上軌',
-        line=dict(color='#e74c3c', dash='dash', width=1)
-    ), row=1, col=1)
+    # ── BB 三軌線 ──
+    if 'BB_UPPER' in df.columns:
+        fig.add_trace(go.Scatter(
+            x=df['date'], y=df['BB_UPPER'],
+            mode='lines', name='BB 上軌',
+            line=dict(color='#e74c3c', dash='dash', width=1.2)
+        ), row=1, col=1)
 
     fig.add_trace(go.Scatter(
         x=df['date'], y=df['BB_MID'],
@@ -1076,28 +1452,42 @@ def create_bb_obv_chart(df, symbol, currency_symbol='$'):
         fig.add_trace(go.Scatter(
             x=df['date'], y=df['BB_LOWER'],
             mode='lines', name='BB 下軌',
-            line=dict(color='#2ecc71', dash='dash', width=1)
+            line=dict(color='#2ecc71', dash='dash', width=1.2)
         ), row=1, col=1)
 
-    # 收盤價線
-    fig.add_trace(go.Scatter(
-        x=df['date'], y=df['close'],
-        mode='lines', name='收盤價',
-        line=dict(color='#2c3e50', width=1.5)
+    # ── K線柱狀圖（疊在 BB 上方）──
+    fig.add_trace(go.Candlestick(
+        x=df['date'],
+        open=df['open'],
+        high=df['high'],
+        low=df['low'],
+        close=df['close'],
+        name='K線',
+        increasing_line_color='#ff4757',
+        decreasing_line_color='#2ed573',
+        increasing_fillcolor='#ff4757',
+        decreasing_fillcolor='#2ed573',
     ), row=1, col=1)
 
-    # BB 壓縮期背景色塊（BB_WIDTH < 歷史均值50%）
+    # ── BB 壓縮期背景橙色色塊 ──
     if 'BB_WIDTH' in df.columns:
         w_mean = df['BB_WIDTH'].mean()
-        compressed_dates = df[df['BB_WIDTH'] < w_mean * 0.5]['date']
-        for d in compressed_dates:
-            fig.add_vrect(
-                x0=d, x1=d,
-                fillcolor='rgba(255,165,0,0.15)',
-                line_width=0, row=1, col=1
-            )
+        compressed = df[df['BB_WIDTH'] < w_mean * 0.5].copy()
+        if len(compressed) > 0:
+            # 找連續壓縮區間，合併為矩形塊，避免過多 vrect 拖慢渲染
+            compressed['gap'] = (compressed.index.to_series().diff() > 1)
+            block_id = compressed['gap'].cumsum()
+            for _, block in compressed.groupby(block_id):
+                x0 = block['date'].iloc[0]
+                x1 = block['date'].iloc[-1]
+                fig.add_vrect(
+                    x0=x0, x1=x1,
+                    fillcolor='rgba(255,165,0,0.12)',
+                    line_width=0,
+                    row=1, col=1
+                )
 
-    # OBV 圖
+    # ── OBV 圖 ──
     if has_obv:
         fig.add_trace(go.Scatter(
             x=df['date'], y=df['OBV'],
@@ -1105,12 +1495,15 @@ def create_bb_obv_chart(df, symbol, currency_symbol='$'):
             line=dict(color='#9b59b6', width=2)
         ), row=2, col=1)
 
+    # ── 佈局 ──
     fig.update_layout(
-        title=f'{symbol} 布林通道（20, 2SD）+ OBV',
-        height=600,
+        title=f'{symbol} 布林通道（20, 2SD）+ K線 + OBV',
+        height=650,
         template='plotly_white',
+        xaxis_rangeslider_visible=False,
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1)
     )
+    fig.update_xaxes(rangeslider_visible=False, row=1, col=1)
     fig.update_yaxes(title_text=f"價格 ({currency_symbol})", row=1, col=1)
     if has_obv:
         fig.update_yaxes(title_text="OBV", row=2, col=1)
@@ -1174,7 +1567,8 @@ def create_dmi_chart(df, symbol):
 
 def generate_ai_insights(symbol, stock_data, openai_api_key, start_date, end_date,
                           market='us', margin_df=None, institutional_df=None,
-                          financial_data=None, rsi_period=14, bull_signals=None):
+                          financial_data=None, rsi_period=14, bull_signals=None,
+                          insider_df=None, analyst_data=None, pe_data=None):
     """
     使用 OpenAI gpt-4o-mini 進行技術面（美股）或技術面+籌碼面+財務面（台股）分析
 
@@ -1218,16 +1612,19 @@ def generate_ai_insights(symbol, stock_data, openai_api_key, start_date, end_dat
         data_json = stock_data.tail(60).to_json(orient='records', date_format='iso')
 
         # ── System Message ──
-        system_base = f"""你是一位專業的技術分析師，專精於{market_desc}股票技術分析和歷史數據解讀。你的職責包括：
+        system_base = f"""你是一位專業的股票分析師，專精於{market_desc}股票技術面、籌碼面與基本面分析和歷史數據解讀。你的職責包括：
 
 1. 客觀描述股票價格的歷史走勢和技術指標狀態
 2. 解讀歷史市場數據和交易量變化模式
 3. 識別技術面的歷史支撐阻力位
-4. 提供純教育性的技術分析知識，包含RSI動量指標解讀"""
+4. 提供純教育性的技術分析知識，包含RSI動量指標解讀
+5. 解讀內部人（董監事）買賣動向的歷史意涵
+6. 描述分析師目標價分布與評級共識的歷史統計
+7. 解讀 P/E、P/S 歷年估值變化的歷史特徵"""
 
         system_tw_extra = """
-5. 解讀台股特有的籌碼面指標，包括三大法人買賣超動向、融資融券餘額變化
-6. 結合財務報表數據進行基本面輔助解讀"""
+8. 解讀台股特有的籌碼面指標，包括三大法人買賣超動向、融資融券餘額變化
+9. 結合財務報表數據進行基本面輔助解讀"""
 
         system_rules = """
 
@@ -1264,6 +1661,35 @@ def generate_ai_insights(symbol, stock_data, openai_api_key, start_date, end_dat
 ### 完整交易數據（含 MA 與 RSI，最近60筆）
 {data_json}
 """
+
+        # 內部人買賣（美股）
+        if insider_df is not None and len(insider_df) > 0:
+            try:
+                ins_json = insider_df.head(20).to_json(orient='records', date_format='iso')
+                user_prompt += f"\n### 內部人買賣紀錄（近3個月，最新20筆）\n{ins_json}\n"
+            except Exception:
+                pass
+
+        # 法人目標價（美股）
+        if analyst_data is not None:
+            try:
+                tgt = analyst_data.get('targets')
+                con = analyst_data.get('consensus')
+                if tgt is not None and len(tgt) > 0:
+                    tgt_json = tgt.head(10).to_json(orient='records', date_format='iso')
+                    user_prompt += f"\n### 分析師目標價（最新10筆）\n{tgt_json}\n"
+                if con:
+                    user_prompt += f"\n### 分析師共識評級\n{json.dumps(con, ensure_ascii=False)}\n"
+            except Exception:
+                pass
+
+        # P/E P/S 歷年資料
+        if pe_data is not None and pe_data.get('ratios') is not None:
+            try:
+                pe_json = pe_data['ratios'].to_json(orient='records', date_format='iso')
+                user_prompt += f"\n### 歷年 P/E、P/S、P/B 比率\n{pe_json}\n"
+            except Exception:
+                pass
 
         # 台股附加數據
         if market == 'tw':
@@ -1338,28 +1764,44 @@ def generate_ai_insights(symbol, stock_data, openai_api_key, start_date, end_dat
 - 評分的歷史統計意涵
 - 訊號密集度與時序重疊觀察
 
-#### 9. 籌碼面分析（台股特有，必要章節）
+#### 9. 內部人買賣分析（必要章節，若有資料）
+- 近3個月董監事、大股東買賣動向
+- 淨買超或淨賣超的歷史意涵
+- 內部人交易的局限性說明
+
+#### 10. 法人目標價分析（必要章節，若有資料）
+- 分析師目標價分布（最高/最低/平均）
+- 與現價差距百分比描述
+- 評級共識（買入/持有/賣出比例）
+- 目標價的局限性說明
+
+#### 11. P/E、P/S 歷年估值分析（必要章節，若有資料）
+- 當前估值與歷史均值的比較
+- 估值高低的歷史脈絡描述
+- 估值指標的局限性
+
+#### 12. 籌碼面分析（台股特有，必要章節）
 - 三大法人（外資、投信、自營商）買賣超趨勢分析
 - 外資動向與價格走勢的歷史關聯性
 - 融資餘額變化與市場槓桿水位觀察
 - 融券餘額與空方籌碼分布的歷史意涵
 - 籌碼面指標的局限性說明
 
-#### 10. 財務面輔助觀察（台股特有，必要章節）
+#### 13. 財務面輔助觀察（台股特有，必要章節）
 - EPS 趨勢歷史觀察（季度變化）
 - 營收成長性歷史數據描述
 - 資產負債結構的歷史變化
 - 財務面分析的局限性
 
-#### 11. 價格行為分析
+#### 14. 價格行為分析
 - 重要的價格突破點
 - 波動性評估
 
-#### 12. 風險評估
+#### 15. 風險評估
 - 技術面風險因子
 - 市場情緒指標
 
-#### 13. 市場觀察
+#### 16. 市場觀察
 - 短期技術面觀察（1-2週）
 - 中期技術面觀察（1-3個月）
 
@@ -1408,17 +1850,33 @@ def generate_ai_insights(symbol, stock_data, openai_api_key, start_date, end_dat
 - 評分的歷史統計意涵
 - 訊號密集度與時序重疊觀察
 
-#### 9. 價格行為分析
+#### 9. 內部人買賣分析（必要章節，若有資料）
+- 近3個月董監事、大股東買賣動向
+- 淨買超或淨賣超的歷史意涵
+- 內部人交易的局限性說明
+
+#### 10. 法人目標價分析（必要章節，若有資料）
+- 分析師目標價分布（最高/最低/平均）
+- 與現價差距百分比描述
+- 評級共識（買入/持有/賣出比例）
+- 目標價的局限性說明
+
+#### 11. P/E、P/S 歷年估值分析（必要章節，若有資料）
+- 當前估值與歷史均值的比較
+- 估值高低的歷史脈絡描述
+- 估值指標的局限性
+
+#### 12. 價格行為分析
 - 重要的價格突破點
 - 波動性評估
 - 關鍵的轉折點識別
 
-#### 10. 風險評估
+#### 13. 風險評估
 - 當前價位的風險等級
 - 潛在的支撐和阻力區間
 - 市場情緒指標
 
-#### 11. 市場觀察
+#### 14. 市場觀察
 - 短期技術面觀察（1-2週）
 - 中期技術面觀察（1-3個月）
 - 技術面風險因子
@@ -1585,10 +2043,13 @@ if analyze_button:
                 # ── Step 2c: 計算多頭訊號評分 ──
                 bull_signals = calculate_bull_signals(data_with_indicators)
 
-                # ── Step 3 (台股): 籌碼數據 ──
+                # ── Step 3: 籌碼/附加數據 ──
                 margin_df = None
                 institutional_df = None
                 financial_data = None
+                insider_df     = None
+                analyst_data   = None
+                pe_data        = None
 
                 if is_tw:
                     with st.spinner("正在獲取台股籌碼數據（融資融券、三大法人）..."):
@@ -1598,6 +2059,9 @@ if analyze_button:
                     with st.spinner("正在獲取財務報表數據..."):
                         financial_data = get_tw_financial_statements(symbol.strip(), finmind_api_key)
 
+                    with st.spinner("正在獲取 P/E 歷史估值數據..."):
+                        pe_data = get_tw_pe_ps_history(symbol.strip(), finmind_api_key)
+
                     # 附加數據狀態反饋
                     status_parts = []
                     if margin_df is not None:
@@ -1606,11 +2070,31 @@ if analyze_button:
                         status_parts.append("三大法人")
                     if financial_data and (financial_data.get('quarterly') is not None or financial_data.get('annual') is not None):
                         status_parts.append("財務報表")
+                    if pe_data is not None:
+                        status_parts.append("P/E歷年估值")
 
                     if status_parts:
                         st.success(f"成功獲取台股附加數據：{'、'.join(status_parts)}")
                     else:
                         st.warning("台股附加數據（籌碼/財務）獲取失敗，將僅顯示技術面分析。")
+                else:
+                    # 美股：獲取內部人買賣、法人目標價、P/E P/S
+                    with st.spinner("正在獲取內部人買賣紀錄..."):
+                        insider_df = get_insider_trading(symbol.upper(), fmp_api_key)
+                    with st.spinner("正在獲取法人目標價與評級..."):
+                        analyst_data = get_analyst_targets(symbol.upper(), fmp_api_key)
+                    with st.spinner("正在獲取 P/E、P/S 歷年估值數據..."):
+                        pe_data = get_pe_ps_history(symbol.upper(), fmp_api_key)
+
+                    status_parts = []
+                    if insider_df is not None:
+                        status_parts.append(f"內部人買賣（{len(insider_df)}筆）")
+                    if analyst_data is not None:
+                        status_parts.append("法人目標價")
+                    if pe_data is not None:
+                        status_parts.append("P/E歷年估值")
+                    if status_parts:
+                        st.success(f"成功獲取附加數據：{'、'.join(status_parts)}")
 
                 if data_with_indicators is not None:
 
@@ -1725,7 +2209,54 @@ if analyze_button:
                             a_df = financial_data['annual'].copy().head(10)
                             st.dataframe(a_df, use_container_width=True, hide_index=True)
 
-                    # ── Step 9b: 多頭訊號儀表板 ──
+                    # ── Step 9b: 內部人買賣圖 ──
+                    if insider_df is not None and len(insider_df) > 0:
+                        insider_fig = create_insider_chart(insider_df, symbol.upper() if not is_tw else symbol.strip())
+                        if insider_fig:
+                            st.markdown("### 👤 內部人買賣紀錄（近3個月）")
+                            st.plotly_chart(insider_fig, use_container_width=True)
+
+                    # ── Step 9c: 法人目標價圖 ──
+                    if analyst_data is not None:
+                        current_price = data_with_indicators['close'].iloc[-1]
+                        analyst_fig = create_analyst_chart(
+                            analyst_data,
+                            symbol.upper() if not is_tw else symbol.strip(),
+                            currency_symbol,
+                            current_price
+                        )
+                        if analyst_fig:
+                            st.markdown("### 🎯 法人目標價分布")
+                            st.plotly_chart(analyst_fig, use_container_width=True)
+                            # 顯示共識摘要
+                            con = analyst_data.get('consensus')
+                            if con:
+                                cc1, cc2, cc3, cc4 = st.columns(4)
+                                tgt_hi  = con.get('targetHigh')  or con.get('targetHighPrice')
+                                tgt_lo  = con.get('targetLow')   or con.get('targetLowPrice')
+                                tgt_avg = con.get('targetConsensus') or con.get('targetMean') or con.get('priceTarget')
+                                rating  = con.get('consensus') or con.get('rating') or '—'
+                                with cc1:
+                                    st.metric("目標價最高", f"{currency_symbol}{float(tgt_hi):.2f}" if tgt_hi else "—")
+                                with cc2:
+                                    st.metric("目標價最低", f"{currency_symbol}{float(tgt_lo):.2f}" if tgt_lo else "—")
+                                with cc3:
+                                    st.metric("目標價均值", f"{currency_symbol}{float(tgt_avg):.2f}" if tgt_avg else "—")
+                                with cc4:
+                                    st.metric("共識評級", str(rating))
+
+                    # ── Step 9d: P/E P/S 歷年比較圖 ──
+                    if pe_data is not None:
+                        pe_fig = create_pe_ps_chart(
+                            pe_data,
+                            symbol.upper() if not is_tw else symbol.strip(),
+                            data_with_indicators
+                        )
+                        if pe_fig:
+                            st.markdown("### 📐 P/E、P/S 歷年估值比較圖")
+                            st.plotly_chart(pe_fig, use_container_width=True)
+
+                    # ── Step 9e: 多頭訊號儀表板 ──
                     display_bull_dashboard(bull_signals, symbol.strip() if is_tw else symbol.upper())
 
                     # ── Step 9c: MACD 圖 ──
@@ -1771,7 +2302,10 @@ if analyze_button:
                             institutional_df=institutional_df,
                             financial_data=financial_data,
                             rsi_period=rsi_period,
-                            bull_signals=bull_signals
+                            bull_signals=bull_signals,
+                            insider_df=insider_df,
+                            analyst_data=analyst_data,
+                            pe_data=pe_data
                         )
 
                     if ai_analysis:
