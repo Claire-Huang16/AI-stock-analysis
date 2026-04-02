@@ -9,12 +9,13 @@ import json
 import numpy as np
 
 
-# 修改：加入側邊欄自動收合邏輯
+# 找到這段程式碼並修改 initial_sidebar_state
 st.set_page_config(
     page_title="AI 股票趨勢分析系統",
     page_icon="📈",
-    layout="wide",  # iPad 橫向螢幕必備
-    initial_sidebar_state="auto" # 讓系統根據螢幕寬度自動決定是否顯示側邊欄
+    layout="wide",
+    initial_sidebar_state="expanded"  # 將這裡改為 "expanded"
+)
 )
 
 # 加入自訂 CSS 讓 UI 在平板上更像原生 App
