@@ -1235,7 +1235,7 @@ def generate_ai_insights(symbol, stock_data, openai_api_key, start_date, end_dat
 - 僅提供歷史數據分析和技術指標解讀，絕不提供任何投資建議或預測
 - 保持完全客觀中立的分析態度
 - 使用專業術語但保持易懂
-- 所有分析僅供教育和研究目的
+- 所有分析僅供研究目的
 - 強調技術分析的局限性和不確定性
 - 使用繁體中文回答
 
@@ -1247,7 +1247,7 @@ def generate_ai_insights(symbol, stock_data, openai_api_key, start_date, end_dat
 - 強調「歷史表現不代表未來結果」
 - 避免任何可能被解讀為操作指引的表達
 
-免責聲明：所提供的分析內容純粹基於歷史數據的技術解讀，僅供教育和研究參考，不構成任何投資建議或未來走勢預測。歷史表現不代表未來結果。"""
+免責聲明：所提供的分析內容純粹基於歷史數據的技術解讀，僅供研究參考，不構成任何投資建議或未來走勢預測。歷史表現不代表未來結果。"""
 
         system_message = system_base + (system_tw_extra if market == 'tw' else '') + system_rules
 
@@ -1529,7 +1529,7 @@ analyze_button = st.sidebar.button("🚀 開始分析", type="primary", use_cont
 st.sidebar.markdown("---")
 st.sidebar.markdown("""
 ### 📢 免責聲明
-本系統僅供學術研究與教育用途，AI 提供的數據與分析結果僅供參考，**不構成投資建議或財務建議**。
+本系統僅供學術研究用途，AI 提供的數據與分析結果僅供參考，**不構成投資建議或財務建議**。
 
 請使用者自行判斷投資決策，並承擔相關風險。本系統作者不對任何投資行為負責，亦不承擔任何損失責任。
 """)
