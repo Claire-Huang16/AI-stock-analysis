@@ -7,35 +7,25 @@ from openai import OpenAI
 from datetime import datetime, timedelta
 import json
 import numpy as np
+import time
+import random
+try:
+    from bs4 import BeautifulSoup as _BS4
+    _BS4_OK = True
+except ImportError:
+    _BS4_OK = False
 
 # 設置頁面配置
 st.set_page_config(
     page_title="AI 股票趨勢分析系統",
     page_icon="📈",
     layout="wide",
-    initial_sidebar_state="expanded"  # 將這裡改為 "expanded"
-)
-
-st.markdown(
-    """
-    <style>
-    /* 強制顯示側邊欄按鈕，並將其放大、變色，方便 iPad 點擊 */
-    [data-testid="collapsedControl"] {
-        color: white;
-        background-color: #ff4b4b; /* 變成紅色，讓你一定看得到 */
-        border-radius: 50%;
-        left: 10px;
-        top: 10px;
-    }
-    </style>
-    """,
-    unsafe_allow_html=True
+    initial_sidebar_state="expanded"
 )
 
 # 主標題
 st.title("📈 AI 股票趨勢分析系統")
 st.divider()
-
 
 
 # ─────────────────────────────────────────────
@@ -467,138 +457,335 @@ def get_tw_pe_ps_history(symbol, api_key):
         return None
 
 
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 台股內部人資料來源 A：MOPS 公開資訊觀測站（按民國年度查詢）
+# ─────────────────────────────────────────────────────────────────────────────
+
+def get_mops_insider_changes(stock_code: str, year_roc: int = None) -> tuple:
+    """
+    公開資訊觀測站 — 董監事持股異動申報（ajax_t51sb06）
+    year_roc：民國年，預設查當年度；同時也查上一年以補齊近6個月資料。
+    回傳 (DataFrame, error_str | None)
+    DataFrame 欄位統一為：申報日期、職稱、姓名、異動前持股數、異動後持股數、異動股數、買賣
+    """
+    if year_roc is None:
+        year_roc = datetime.now().year - 1911
+
+    _mops_headers = {
+        "User-Agent": (
+            "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+            "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
+        ),
+        "Accept":   "application/json, text/javascript, */*; q=0.01",
+        "Referer":  "https://mops.twse.com.tw/mops/web/t51sb06",
+        "X-Requested-With": "XMLHttpRequest",
+    }
+
+    def _fetch_year(yr):
+        url = "https://mops.twse.com.tw/mops/web/ajax_t51sb06"
+        form = {
+            "encodeURIComponent": "1", "step": "1", "firstin": "1",
+            "off": "1", "queryName": "co_id", "inpuType": "co_id",
+            "TYPEK": "all", "isnew": "false",
+            "co_id": str(stock_code), "year": str(yr),
+        }
+        try:
+            resp = requests.post(url, data=form, headers=_mops_headers, timeout=20)
+            if resp.status_code != 200:
+                return pd.DataFrame(), f"MOPS HTTP {resp.status_code}"
+            resp.encoding = "utf-8"
+            if not _BS4_OK:
+                return pd.DataFrame(), "缺少 beautifulsoup4（pip install beautifulsoup4）"
+            soup = _BS4(resp.text, "html.parser")
+            tables = soup.find_all("table")
+            if not tables:
+                return pd.DataFrame(), None   # 無資料（非錯誤）
+            dfs = []
+            for tbl in tables:
+                try:
+                    sub = pd.read_html(str(tbl))
+                    for df in sub:
+                        if df.shape[0] > 0 and df.shape[1] >= 4:
+                            dfs.append(df)
+                except Exception:
+                    continue
+            if not dfs:
+                return pd.DataFrame(), None
+            df = pd.concat(dfs, ignore_index=True)
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = [
+                    " ".join(str(c) for c in col if "Unnamed" not in str(c)).strip()
+                    for col in df.columns
+                ]
+            df.columns = [str(c).strip() for c in df.columns]
+            df = df.dropna(how="all").reset_index(drop=True)
+            return df, None
+        except requests.exceptions.Timeout:
+            return pd.DataFrame(), "MOPS 請求逾時"
+        except requests.exceptions.ConnectionError:
+            return pd.DataFrame(), "無法連線至 MOPS"
+        except Exception as e:
+            return pd.DataFrame(), str(e)
+
+    # 查當年 + 上一年，合併後統一欄位
+    all_dfs, last_err = [], None
+    for yr in [year_roc, year_roc - 1]:
+        df_yr, err = _fetch_year(yr)
+        if not df_yr.empty:
+            all_dfs.append(df_yr)
+        if err:
+            last_err = err
+
+    if not all_dfs:
+        return pd.DataFrame(), last_err or "MOPS 無申報資料"
+
+    df = pd.concat(all_dfs, ignore_index=True).drop_duplicates()
+
+    # 標準化欄位名稱
+    col_map = {}
+    for c in df.columns:
+        cs = str(c).strip()
+        if "申報" in cs and "日" in cs:   col_map[c] = "申報日期"
+        elif "職稱" in cs or "職務" in cs: col_map[c] = "職稱"
+        elif "姓名" in cs or "名稱" in cs: col_map[c] = "姓名"
+        elif "異動前" in cs:               col_map[c] = "異動前持股數"
+        elif "異動後" in cs:               col_map[c] = "異動後持股數"
+        elif "異動" in cs and "股" in cs:  col_map[c] = "異動股數原始"
+    if col_map:
+        df = df.rename(columns=col_map)
+
+    # 民國年 → 西元年
+    def _roc_to_ad(s):
+        try:
+            parts = str(s).strip().split("/")
+            if len(parts) == 3:
+                return f"{int(parts[0]) + 1911}-{parts[1].zfill(2)}-{parts[2].zfill(2)}"
+        except Exception:
+            pass
+        return s
+
+    if "申報日期" in df.columns:
+        df["申報日期"] = df["申報日期"].apply(_roc_to_ad)
+        df["date"] = pd.to_datetime(df["申報日期"], errors="coerce")
+    else:
+        df["date"] = pd.NaT
+
+    def _ci(v):
+        try:
+            return int(str(v).replace(",", "").replace("，", "").strip())
+        except Exception:
+            return 0
+
+    for col in ["異動前持股數", "異動後持股數", "異動股數原始"]:
+        if col in df.columns:
+            df[col] = df[col].apply(_ci)
+
+    if "異動前持股數" in df.columns and "異動後持股數" in df.columns:
+        df["異動股數"] = df["異動後持股數"] - df["異動前持股數"]
+    elif "異動股數原始" in df.columns:
+        df["異動股數"] = df["異動股數原始"]
+    else:
+        df["異動股數"] = 0
+
+    df["買賣"] = df["異動股數"].apply(
+        lambda x: "🔴買入" if x > 0 else ("🟢賣出" if x < 0 else "－")
+    )
+    df = df.dropna(subset=["date"]).sort_values("date", ascending=False).reset_index(drop=True)
+    return (df, None) if len(df) > 0 else (pd.DataFrame(), "MOPS 無有效申報記錄")
+
+
 def get_tw_director_sharehold(symbol, api_key=None):
     """
-    台股內部人買賣（台灣證交所公開資訊觀測站）
-    端點: https://www.twse.com.tw/rwd/zh/fund/TWT38U?response=json&stockNo={symbol}&date={YYYYMMDD}
-    逐月查詢今月、上月、上上月，合併近3個月申報資料
-    欄位：申報日期、職稱、姓名、異動前持股數、異動後持股數、異動股數、買賣
+    台股內部人持股異動 — 雙來源策略
+    ────────────────────────────────
+    主來源：MoneyDJ 董監質設異動清單（近3個月，HTML 爬取）
+    備用來源：MOPS 公開資訊觀測站（當年度 + 上年度，POST API）
+
+    防爬蟲措施（MoneyDJ）：
+    - 隨機 User-Agent 輪換（6 組）
+    - 隨機請求延遲 1.0~2.5 秒
+    - Session 複用 + Cookie 暖身
+    - Referer / DNT / Accept-Encoding 擬真標頭
+    - WAF / Cloudflare 偵測後自動降級至 MOPS
+
+    回傳 dict：
+      {
+        "moneydj": DataFrame | None,   # 近3個月申報（MoneyDJ）
+        "mops":    DataFrame | None,   # 年度申報（MOPS，當年+上年）
+        "source":  "moneydj" | "mops" | "both" | "none",
+      }
+    以 director_df["moneydj"] / director_df["mops"] 分別取用。
     """
-    try:
-        from datetime import datetime, timedelta
-        import calendar
+    _USER_AGENTS = [
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36 Edg/123.0.0.0",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0",
+        "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4_1) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4.1 Safari/605.1.15",
+        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
+    ]
 
-        today = datetime.now()
-        all_records = []
+    def _rh(referer="https://www.moneydj.com/"):
+        return {
+            "User-Agent":      random.choice(_USER_AGENTS),
+            "Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
+            "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.7,en;q=0.5",
+            "Accept-Encoding": "gzip, deflate, br",
+            "DNT":             "1",
+            "Connection":      "keep-alive",
+            "Upgrade-Insecure-Requests": "1",
+            "Referer":         referer,
+            "Cache-Control":   "max-age=0",
+        }
 
-        for months_back in range(3):
-            # 計算該月最後一天
-            y = today.year
-            m = today.month - months_back
-            while m <= 0:
-                m += 12
-                y -= 1
-            last_day = calendar.monthrange(y, m)[1]
-            query_date = f"{y}{m:02d}{last_day:02d}"
+    def _jitter(lo=1.0, hi=2.5):
+        time.sleep(random.uniform(lo, hi))
 
-            url = (
-                f"https://www.twse.com.tw/rwd/zh/fund/TWT38U"
-                f"?response=json&stockNo={symbol}&date={query_date}"
-            )
-            headers = {
-                'User-Agent': (
-                    'Mozilla/5.0 (Windows NT 10.0; Win64; x64) '
-                    'AppleWebKit/537.36 (KHTML, like Gecko) '
-                    'Chrome/124.0.0.0 Safari/537.36'
-                ),
-                'Accept-Language': 'zh-TW,zh;q=0.9',
-                'Referer': 'https://www.twse.com.tw/'
-            }
+    def _decode(raw):
+        for enc in ("big5", "cp950", "utf-8"):
             try:
-                resp = requests.get(url, headers=headers, timeout=20)
-                resp.raise_for_status()
-                result = resp.json()
-
-                if result.get('stat') not in ('OK', 'ok') and result.get('status') not in ('OK', 'ok'):
-                    # 嘗試直接取 data
-                    pass
-
-                data = result.get('data', [])
-                fields = result.get('fields', [])
-
-                if not data:
-                    continue
-
-                df_m = pd.DataFrame(data, columns=fields if fields else None)
-
-                # 標準化欄位名稱（TWSE 使用繁體中文）
-                col_map = {}
-                for c in df_m.columns:
-                    cs = str(c).strip()
-                    if '申報' in cs and '日' in cs:
-                        col_map[c] = '申報日期'
-                    elif '職稱' in cs or '職務' in cs:
-                        col_map[c] = '職稱'
-                    elif '姓名' in cs or '名稱' in cs:
-                        col_map[c] = '姓名'
-                    elif '異動前' in cs:
-                        col_map[c] = '異動前持股數'
-                    elif '異動後' in cs:
-                        col_map[c] = '異動後持股數'
-                    elif '異動' in cs and '股' in cs:
-                        col_map[c] = '異動股數原始'
-
-                if col_map:
-                    df_m = df_m.rename(columns=col_map)
-
-                all_records.append(df_m)
-
-            except Exception:
-                continue
-
-        if not all_records:
-            return None
-
-        df = pd.concat(all_records, ignore_index=True)
-
-        # 民國年轉西元年
-        def roc_to_ad(s):
-            try:
-                parts = str(s).strip().split('/')
-                if len(parts) == 3:
-                    return f"{int(parts[0]) + 1911}-{parts[1].zfill(2)}-{parts[2].zfill(2)}"
+                return raw.decode(enc, errors="replace")
             except Exception:
                 pass
-            return s
+        return raw.decode("utf-8", errors="replace")
 
-        if '申報日期' in df.columns:
-            df['申報日期'] = df['申報日期'].apply(roc_to_ad)
-            df['date'] = pd.to_datetime(df['申報日期'], errors='coerce')
-        else:
-            df['date'] = pd.NaT
-
-        # 數值欄位清理（移除千分位逗號）
-        def clean_int(v):
+    def _fetch_moneydj():
+        """爬取 MoneyDJ 個股董監頁，回傳 DataFrame | None"""
+        if not _BS4_OK:
+            return None
+        try:
+            session = requests.Session()
+            session.max_redirects = 5
             try:
-                return int(str(v).replace(',', '').replace('，', '').strip())
+                session.get("https://www.moneydj.com/",
+                            headers=_rh("https://www.google.com/"), timeout=10)
+                _jitter(0.8, 1.8)
             except Exception:
-                return 0
+                pass
 
-        for col in ['異動前持股數', '異動後持股數', '異動股數原始']:
-            if col in df.columns:
-                df[col] = df[col].apply(clean_int)
+            url = f"https://www.moneydj.com/z/zc/zck/zck_{symbol}.djhtm"
+            resp = session.get(url, headers=_rh(), timeout=20)
+            resp.raise_for_status()
+            _jitter(0.5, 1.2)
 
-        # 計算異動股數（異動後 - 異動前）
-        if '異動前持股數' in df.columns and '異動後持股數' in df.columns:
-            df['異動股數'] = df['異動後持股數'] - df['異動前持股數']
-        elif '異動股數原始' in df.columns:
-            df['異動股數'] = df['異動股數原始']
-        else:
+            html = _decode(resp.content)
+            if len(html) < 800:
+                return None
+            if any(kw in html for kw in ["Cloudflare", "Just a moment",
+                                          "Enable JavaScript", "access denied"]):
+                return None
+
+            soup = _BS4(html, "html.parser")
+            target_table, best_n = None, 0
+            for tbl in soup.find_all("table"):
+                txt = tbl.get_text()
+                if any(kw in txt for kw in ["買進", "轉讓", "持股", "職稱", "申報"]):
+                    n = len(tbl.find_all("tr"))
+                    if n > best_n:
+                        best_n, target_table = n, tbl
+
+            if target_table is None or best_n < 3:
+                return None
+
+            rows = target_table.find_all("tr")
+            ci = {k: None for k in ["date","role","name","before","after","buy","sell","pct"]}
+            for i, cell in enumerate(rows[0].find_all(["th","td"])):
+                t = cell.get_text(strip=True)
+                if "申報" in t and "日" in t:           ci["date"]   = i
+                elif "職" in t or "身份" in t:          ci["role"]   = i
+                elif "姓名" in t or "代表" in t:         ci["name"]   = i
+                elif "異動前" in t or "選任" in t:       ci["before"] = i
+                elif "異動後" in t or "目前" in t:       ci["after"]  = i
+                elif "買進" in t:                       ci["buy"]    = i
+                elif "賣出" in t or "轉讓" in t:        ci["sell"]   = i
+                elif "%" in t and "持股" in t:          ci["pct"]    = i
+
+            def _ci_val(v):
+                try:
+                    return int(str(v).replace(",","").replace("，","")
+                               .replace("-","0").strip() or "0")
+                except Exception:
+                    return 0
+
+            now_yr = datetime.now().year
+            cutoff = datetime.now() - timedelta(days=90)
+            recs = []
+
+            for row in rows[1:]:
+                cells = row.find_all("td")
+                if len(cells) < 3:
+                    continue
+                def _g(idx):
+                    return cells[idx].get_text(strip=True) if idx is not None and idx < len(cells) else ""
+
+                raw_d = _g(ci["date"]) if ci["date"] is not None else cells[0].get_text(strip=True)
+                dt = None
+                for fmt, s in [("%Y/%m/%d", raw_d), ("%Y/%m/%d", f"{now_yr}/{raw_d}")]:
+                    try:
+                        dt = datetime.strptime(s, fmt); break
+                    except Exception:
+                        pass
+                if not dt or dt < cutoff:
+                    continue
+
+                buy_sh  = _ci_val(_g(ci["buy"]))    if ci["buy"]    is not None else 0
+                sell_sh = _ci_val(_g(ci["sell"]))   if ci["sell"]   is not None else 0
+                before  = _ci_val(_g(ci["before"])) if ci["before"] is not None else 0
+                after   = _ci_val(_g(ci["after"]))  if ci["after"]  is not None else 0
+                pct_str = _g(ci["pct"])             if ci["pct"]    is not None else ""
+
+                if buy_sh > 0 or sell_sh > 0:
+                    delta = (buy_sh - sell_sh) * 1000
+                elif before > 0 or after > 0:
+                    delta = (after - before) * 1000
+                else:
+                    continue
+                if delta == 0:
+                    continue
+
+                recs.append({
+                    "申報日期":    raw_d,
+                    "職稱":       _g(ci["role"]),
+                    "姓名":       _g(ci["name"]),
+                    "異動前持股數": before * 1000,
+                    "異動後持股數": after  * 1000,
+                    "買進(千股)":  buy_sh,
+                    "賣出(千股)":  sell_sh,
+                    "異動股數":    delta,
+                    "持股%":      pct_str,
+                    "買賣":       "🔴買入" if delta > 0 else "🟢賣出",
+                    "date":       dt,
+                })
+
+            if not recs:
+                return None
+            return (pd.DataFrame(recs)
+                    .sort_values("date", ascending=False)
+                    .reset_index(drop=True))
+
+        except Exception:
             return None
 
-        df['買賣'] = df['異動股數'].apply(
-            lambda x: '🔴買入' if x > 0 else ('🟢賣出' if x < 0 else '－')
-        )
+    # ── 雙來源並行取得 ──────────────────────────────────────────
+    moneydj_df = _fetch_moneydj()
 
-        # 只保留有異動的紀錄
-        df = df[df['異動股數'] != 0].copy()
-        df = df.dropna(subset=['date'])
-        df = df.sort_values('date', ascending=False).reset_index(drop=True)
+    mops_df, _ = get_mops_insider_changes(symbol)
+    if isinstance(mops_df, pd.DataFrame) and mops_df.empty:
+        mops_df = None
 
-        return df if len(df) > 0 else None
+    if moneydj_df is not None and mops_df is not None:
+        source = "both"
+    elif moneydj_df is not None:
+        source = "moneydj"
+    elif mops_df is not None:
+        source = "mops"
+    else:
+        source = "none"
 
-    except Exception:
-        return None
+    return {"moneydj": moneydj_df, "mops": mops_df, "source": source}
+
+
 
 
 def get_insider_trading(symbol, api_key):
@@ -2309,10 +2496,13 @@ def generate_ai_insights(symbol, stock_data, openai_api_key, start_date, end_dat
             if institutional_df is not None and len(institutional_df) > 0:
                 inst_json = institutional_df.tail(40).to_json(orient='records', date_format='iso')
                 user_prompt += f"\n### 三大法人買賣超（最新資料）\n{inst_json}\n"
-            if director_df is not None and len(director_df) > 0:
+            if director_df is not None and isinstance(director_df, dict):
                 try:
-                    dir_json = director_df.head(20).to_json(orient='records', date_format='iso')
-                    user_prompt += f"\n### 近3個月董監持股異動明細（最新20筆）\n{dir_json}\n"
+                    # 優先用 MoneyDJ（近3月），其次用 MOPS
+                    _dir_src = director_df.get("moneydj") or director_df.get("mops")
+                    if _dir_src is not None and len(_dir_src) > 0:
+                        dir_json = _dir_src.head(20).to_json(orient='records', date_format='iso')
+                        user_prompt += f"\n### 近3個月董監持股異動明細（最新20筆）\n{dir_json}\n"
                 except Exception:
                     pass
             if financial_data and financial_data.get('quarterly') is not None:
@@ -2643,8 +2833,13 @@ if analyze_button:
                     with st.spinner("正在獲取財務報表數據（5年）..."):
                         financial_data = get_tw_financial_statements(symbol.strip(), finmind_api_key)
 
-                    with st.spinner("正在獲取台股董監持股異動..."):
-                        director_df = get_tw_director_sharehold(symbol.strip(), finmind_api_key)
+                    with st.spinner("正在從 MoneyDJ + MOPS 獲取台股董監持股異動（含防爬蟲延遲）..."):
+                        _director_result = get_tw_director_sharehold(symbol.strip(), finmind_api_key)
+                        # _director_result 為 dict：{"moneydj": df|None, "mops": df|None, "source": str}
+                        director_df       = _director_result   # 傳遞 dict 給後續顯示邏輯
+                        _dj_df  = _director_result.get("moneydj")
+                        _mp_df  = _director_result.get("mops")
+                        _src    = _director_result.get("source", "none")
 
                     with st.spinner("正在獲取 P/E 歷史估值數據..."):
                         pe_data = get_tw_pe_ps_history(symbol.strip(), finmind_api_key)
@@ -2653,7 +2848,15 @@ if analyze_button:
                     if margin_df is not None:         status_parts.append("融資融券")
                     if institutional_df is not None:   status_parts.append("三大法人")
                     if broker_df is not None:          status_parts.append(f"券商分點({broker_date})")
-                    if director_df is not None:        status_parts.append(f"董監持股異動({len(director_df)}筆)")
+                    if director_df is not None:
+                        _dj_n  = len(_dj_df) if _dj_df is not None else 0
+                        _mp_n  = len(_mp_df) if _mp_df is not None else 0
+                        if _src == "both":
+                            status_parts.append(f"董監持股異動 MoneyDJ({_dj_n}筆)+MOPS({_mp_n}筆)")
+                        elif _src == "moneydj":
+                            status_parts.append(f"董監持股異動-MoneyDJ({_dj_n}筆)")
+                        elif _src == "mops":
+                            status_parts.append(f"董監持股異動-MOPS({_mp_n}筆)")
                     if financial_data and financial_data.get('quarterly') is not None:
                         status_parts.append("財務報表（5年）")
                     if pe_data is not None:            status_parts.append("P/E歷年估值")
@@ -2792,39 +2995,158 @@ if analyze_button:
                         if fin_chart:
                             st.plotly_chart(fin_chart, use_container_width=True)
 
-                    # ── 顯示 8：內部人買賣圖 ──
+                    # ── 顯示 8：內部人買賣儀表板（MoneyDJ 近3月 + MOPS 年度申報）──
                     if is_tw:
-                        st.markdown("### 🔍 內部人買賣分析（台灣證交所申報資料）")
-                        if director_df is not None and len(director_df) > 0:
-                            buy_total  = director_df[director_df['異動股數'] > 0]['異動股數'].sum()
-                            sell_total = abs(director_df[director_df['異動股數'] < 0]['異動股數'].sum())
-                            net_total  = director_df['異動股數'].sum()
-                            dc1, dc2, dc3 = st.columns(3)
-                            with dc1:
-                                st.metric("買入合計（股）", f"{buy_total:,.0f}", delta="🔴 買入")
-                            with dc2:
-                                st.metric("賣出合計（股）", f"{sell_total:,.0f}", delta="🟢 賣出")
-                            with dc3:
-                                st.metric("淨異動（股）", f"{net_total:,.0f}",
-                                          delta="淨買超" if net_total > 0 else "淨賣超")
+                        st.markdown("### 🔍 內部人買賣分析（MoneyDJ + MOPS 雙來源）")
 
-                            # 明細表格：申報日期、職稱、姓名、異動前持股數、異動後持股數、異動股數、買賣
-                            disp_cols = [c for c in [
-                                '申報日期', '職稱', '姓名',
-                                '異動前持股數', '異動後持股數', '異動股數', '買賣'
-                            ] if c in director_df.columns]
-                            if not disp_cols:
-                                # 備用欄位（若 TWSE 欄位名不同）
-                                disp_cols = [c for c in director_df.columns if c != 'date']
-                            disp_df = director_df[disp_cols].copy()
-                            st.dataframe(disp_df, use_container_width=True, hide_index=True)
+                        _dj   = director_df.get("moneydj") if isinstance(director_df, dict) else None
+                        _mp   = director_df.get("mops")    if isinstance(director_df, dict) else None
+                        _srck = director_df.get("source", "none") if isinstance(director_df, dict) else "none"
+
+                        # ── 來源狀態徽章 ──────────────────────────────
+                        _src_badge = {
+                            "both":     "✅ MoneyDJ（近3月）＋ MOPS（年度申報）雙來源",
+                            "moneydj":  "✅ MoneyDJ（近3月）｜ ⚠️ MOPS 暫無資料",
+                            "mops":     "⚠️ MoneyDJ 無法取得（防爬機制）｜ ✅ MOPS（年度申報）",
+                            "none":     "❌ MoneyDJ 與 MOPS 均無法取得資料",
+                        }.get(_srck, "—")
+                        st.caption(f"📡 資料來源狀態：{_src_badge}")
+
+                        # ── 頂部統計卡（整合雙來源）──────────────────
+                        _any_df = _dj if _dj is not None else _mp
+                        if _any_df is not None and len(_any_df) > 0:
+                            _buy_col = "異動股數" if "異動股數" in _any_df.columns else None
+                            if _buy_col:
+                                _buy_t  = _any_df[_any_df[_buy_col] > 0][_buy_col].sum()
+                                _sel_t  = abs(_any_df[_any_df[_buy_col] < 0][_buy_col].sum())
+                                _net_t  = _any_df[_buy_col].sum()
+                                _buy_n  = int((_any_df[_buy_col] > 0).sum())
+                                _sel_n  = int((_any_df[_buy_col] < 0).sum())
+                                dc1, dc2, dc3, dc4 = st.columns(4)
+                                with dc1:
+                                    st.metric("買入合計（股）", f"{_buy_t:,.0f}",
+                                              delta=f"🔴 {_buy_n} 筆")
+                                with dc2:
+                                    st.metric("賣出合計（股）", f"{_sel_t:,.0f}",
+                                              delta=f"🟢 {_sel_n} 筆")
+                                with dc3:
+                                    st.metric("淨異動（股）", f"{_net_t:,.0f}",
+                                              delta="淨買超 ▲" if _net_t > 0 else "淨賣超 ▼")
+                                with dc4:
+                                    _src_label = "MoneyDJ 近3月" if _dj is not None else "MOPS 年度"
+                                    st.metric("申報筆數", f"{len(_any_df)} 筆", delta=_src_label)
+
+                        # ── 頁籤：MoneyDJ ／ MOPS ／ 買賣走勢 ────────
+                        _tab_labels = []
+                        if _dj is not None:   _tab_labels.append("📅 MoneyDJ 近3月申報")
+                        if _mp is not None:   _tab_labels.append("🏛️ MOPS 年度申報")
+                        _tab_labels.append("📊 買賣走勢圖")
+
+                        if _tab_labels:
+                            _tabs = st.tabs(_tab_labels)
+                            _tab_idx = 0
+
+                            # ── 頁籤 A：MoneyDJ ──────────────────────
+                            if _dj is not None:
+                                with _tabs[_tab_idx]:
+                                    st.caption("資料來源：MoneyDJ 董監質設異動清單（近90天申報）")
+                                    _dj_disp_cols = [c for c in [
+                                        "申報日期","職稱","姓名",
+                                        "買進(千股)","賣出(千股)",
+                                        "異動前持股數","異動後持股數","異動股數","持股%","買賣"
+                                    ] if c in _dj.columns]
+                                    if not _dj_disp_cols:
+                                        _dj_disp_cols = [c for c in _dj.columns if c != "date"]
+                                    _dj_disp = _dj[_dj_disp_cols].copy()
+                                    for nc in ["異動前持股數","異動後持股數","異動股數"]:
+                                        if nc in _dj_disp.columns:
+                                            _dj_disp[nc] = _dj_disp[nc].apply(
+                                                lambda v: f"{int(v):,}" if pd.notna(v) else "—")
+                                    st.dataframe(_dj_disp, use_container_width=True, hide_index=True)
+                                _tab_idx += 1
+
+                            # ── 頁籤 B：MOPS ─────────────────────────
+                            if _mp is not None:
+                                with _tabs[_tab_idx]:
+                                    st.caption(f"資料來源：公開資訊觀測站（MOPS）— 董監事持股異動申報，民國 {datetime.now().year - 1911} 年及上年度")
+                                    _mp_disp_cols = [c for c in [
+                                        "申報日期","職稱","姓名",
+                                        "異動前持股數","異動後持股數","異動股數","買賣"
+                                    ] if c in _mp.columns]
+                                    if not _mp_disp_cols:
+                                        _mp_disp_cols = [c for c in _mp.columns if c != "date"]
+                                    _mp_disp = _mp[_mp_disp_cols].copy()
+                                    for nc in ["異動前持股數","異動後持股數","異動股數"]:
+                                        if nc in _mp_disp.columns:
+                                            _mp_disp[nc] = _mp_disp[nc].apply(
+                                                lambda v: f"{int(v):,}" if pd.notna(v) else "—")
+                                    st.dataframe(_mp_disp, use_container_width=True, hide_index=True)
+
+                                    # MOPS CSV 下載
+                                    _mp_csv = _mp_disp.to_csv(index=False).encode("utf-8-sig")
+                                    st.download_button(
+                                        "📥 下載 MOPS 申報 CSV", _mp_csv,
+                                        file_name=f"mops_{symbol.strip()}_{datetime.now().strftime('%Y%m%d')}.csv",
+                                        mime="text/csv", key="mops_csv_dl"
+                                    )
+                                    st.markdown(f"🔗 [至公開資訊觀測站查看原始資料](https://mops.twse.com.tw/mops/web/t51sb06)")
+                                _tab_idx += 1
+
+                            # ── 頁籤 C：買賣走勢圖 ───────────────────
+                            with _tabs[_tab_idx]:
+                                _plot_df = _dj if _dj is not None else _mp
+                                if _plot_df is not None and len(_plot_df) > 0 and "異動股數" in _plot_df.columns:
+                                    _plot_df2 = _plot_df.copy()
+                                    _plot_df2["date2"] = pd.to_datetime(
+                                        _plot_df2.get("date", _plot_df2.get("申報日期")), errors="coerce")
+                                    _plot_df2 = _plot_df2.dropna(subset=["date2"]).sort_values("date2")
+
+                                    _buy_pts  = _plot_df2[_plot_df2["異動股數"] > 0]
+                                    _sell_pts = _plot_df2[_plot_df2["異動股數"] < 0]
+
+                                    _fig_ins = go.Figure()
+                                    if len(_buy_pts) > 0:
+                                        _fig_ins.add_trace(go.Bar(
+                                            x=_buy_pts["date2"],
+                                            y=_buy_pts["異動股數"] / 1000,
+                                            name="買入（千股）",
+                                            marker_color="rgba(34,139,34,0.75)",
+                                            hovertemplate="%{x|%Y-%m-%d}<br>買入：%{y:,.0f} 千股<extra></extra>",
+                                        ))
+                                    if len(_sell_pts) > 0:
+                                        _fig_ins.add_trace(go.Bar(
+                                            x=_sell_pts["date2"],
+                                            y=_sell_pts["異動股數"] / 1000,
+                                            name="賣出（千股）",
+                                            marker_color="rgba(220,53,69,0.75)",
+                                            hovertemplate="%{x|%Y-%m-%d}<br>賣出：%{y:,.0f} 千股<extra></extra>",
+                                        ))
+                                    _fig_ins.update_layout(
+                                        title=f"{symbol.strip()} 董監持股異動走勢（千股）",
+                                        barmode="relative",
+                                        xaxis_title="申報日期",
+                                        yaxis_title="異動千股（正=買入，負=賣出）",
+                                        height=360,
+                                        showlegend=True,
+                                        plot_bgcolor="rgba(0,0,0,0)",
+                                        paper_bgcolor="rgba(0,0,0,0)",
+                                        margin=dict(l=50, r=20, t=50, b=40),
+                                        hovermode="x unified",
+                                    )
+                                    _fig_ins.add_hline(y=0, line_dash="dash",
+                                                       line_color="gray", line_width=1)
+                                    st.plotly_chart(_fig_ins, use_container_width=True)
+                                else:
+                                    st.info("ℹ️ 無足夠資料繪製走勢圖")
+
                         else:
-                            st.info("ℹ️ 近3個月無董監持股申報異動資料（台灣證交所）")
+                            st.info("ℹ️ MoneyDJ 與 MOPS 均無申報異動資料（近90天 / 今年）")
+                            st.caption("可能原因：該股近期無申報紀錄、MoneyDJ 防爬機制、或 MOPS 查無資料。")
 
                         st.markdown(f"""
-🔗 [GoodInfo 董監持股明細查詢](https://goodinfo.tw/tw/StockDirectorSharehold.asp?STOCK_ID={symbol.strip()})
-
-補充查詢：GoodInfo 董監持股明細（含增減股數）
+🔗 [MoneyDJ 董監持股明細](https://www.moneydj.com/z/zc/zck/zck_{symbol.strip()}.djhtm) ｜
+🔗 [GoodInfo 董監持股查詢](https://goodinfo.tw/tw/StockDirectorSharehold.asp?STOCK_ID={symbol.strip()}) ｜
+🔗 [MOPS 公開資訊觀測站](https://mops.twse.com.tw/mops/web/t51sb06)
 """)
                     elif insider_df is not None and len(insider_df) > 0:
                         insider_fig = create_insider_chart(insider_df, symbol.upper())
