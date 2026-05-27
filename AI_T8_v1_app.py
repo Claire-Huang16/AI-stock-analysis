@@ -477,10 +477,22 @@ def get_mops_insider_changes(stock_code: str, year_roc: int = None) -> tuple:
             "Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
             "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36"
         ),
-        "Accept":   "application/json, text/javascript, */*; q=0.01",
-        "Referer":  "https://mops.twse.com.tw/mops/web/t51sb06",
+        "Accept":         "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+        "Accept-Language":"zh-TW,zh;q=0.9,en-US;q=0.7",
+        "Content-Type":   "application/x-www-form-urlencoded",
+        "Referer":        "https://mops.twse.com.tw/mops/web/t51sb06",
         "X-Requested-With": "XMLHttpRequest",
+        "Origin":         "https://mops.twse.com.tw",
     }
+
+    def _decode_mops(raw: bytes) -> str:
+        """MOPS 有時回 Big5，有時回 UTF-8，自動偵測"""
+        for enc in ("utf-8", "big5", "cp950"):
+            try:
+                return raw.decode(enc, errors="strict")
+            except (UnicodeDecodeError, LookupError):
+                pass
+        return raw.decode("utf-8", errors="replace")
 
     def _fetch_year(yr):
         url = "https://mops.twse.com.tw/mops/web/ajax_t51sb06"
@@ -491,25 +503,34 @@ def get_mops_insider_changes(stock_code: str, year_roc: int = None) -> tuple:
             "co_id": str(stock_code), "year": str(yr),
         }
         try:
-            resp = requests.post(url, data=form, headers=_mops_headers, timeout=20)
+            resp = requests.post(url, data=form, headers=_mops_headers, timeout=25)
             if resp.status_code != 200:
                 return pd.DataFrame(), f"MOPS HTTP {resp.status_code}"
-            resp.encoding = "utf-8"
             if not _BS4_OK:
                 return pd.DataFrame(), "缺少 beautifulsoup4（pip install beautifulsoup4）"
-            soup = _BS4(resp.text, "html.parser")
+            html_text = _decode_mops(resp.content)
+            # 判斷是否無資料
+            if "查無資料" in html_text or len(html_text.strip()) < 200:
+                return pd.DataFrame(), None
+            soup = _BS4(html_text, "html.parser")
             tables = soup.find_all("table")
             if not tables:
-                return pd.DataFrame(), None   # 無資料（非錯誤）
+                return pd.DataFrame(), None
             dfs = []
             for tbl in tables:
                 try:
-                    sub = pd.read_html(str(tbl))
+                    sub = pd.read_html(str(tbl), flavor="lxml")
                     for df in sub:
                         if df.shape[0] > 0 and df.shape[1] >= 4:
                             dfs.append(df)
                 except Exception:
-                    continue
+                    try:
+                        sub = pd.read_html(str(tbl))
+                        for df in sub:
+                            if df.shape[0] > 0 and df.shape[1] >= 4:
+                                dfs.append(df)
+                    except Exception:
+                        continue
             if not dfs:
                 return pd.DataFrame(), None
             df = pd.concat(dfs, ignore_index=True)
@@ -3036,13 +3057,14 @@ if analyze_button:
                                     _src_label = "MoneyDJ 近3月" if _dj is not None else "MOPS 年度"
                                     st.metric("申報筆數", f"{len(_any_df)} 筆", delta=_src_label)
 
-                        # ── 頁籤：MoneyDJ ／ MOPS ／ 買賣走勢 ────────
-                        _tab_labels = []
-                        if _dj is not None:   _tab_labels.append("📅 MoneyDJ 近3月申報")
-                        if _mp is not None:   _tab_labels.append("🏛️ MOPS 年度申報")
-                        _tab_labels.append("📊 買賣走勢圖")
+                        # ── 頁籤：有資料才顯示，無資料顯示明確提示 ──
+                        _has_data = (_dj is not None) or (_mp is not None)
+                        if _has_data:
+                            _tab_labels = []
+                            if _dj is not None: _tab_labels.append("📅 MoneyDJ 近3月申報")
+                            if _mp is not None: _tab_labels.append("🏛️ MOPS 年度申報")
+                            _tab_labels.append("📊 買賣走勢圖")
 
-                        if _tab_labels:
                             _tabs = st.tabs(_tab_labels)
                             _tab_idx = 0
 
@@ -3140,10 +3162,28 @@ if analyze_button:
                                     st.info("ℹ️ 無足夠資料繪製走勢圖")
 
                         else:
-                            st.info("ℹ️ MoneyDJ 與 MOPS 均無申報異動資料（近90天 / 今年）")
-                            st.caption("可能原因：該股近期無申報紀錄、MoneyDJ 防爬機制、或 MOPS 查無資料。")
+                            # 雙來源皆失敗 — 給出明確原因和手動查詢方式
+                            st.warning(
+                                "⚠️ **MoneyDJ 與 MOPS 均無法自動取得資料**\n\n"
+                                "**可能原因：**\n"
+                                "- MoneyDJ：防爬蟲機制（403）或近3個月無申報\n"
+                                "- MOPS：網路逾時 或 該股今年度尚無申報記錄\n\n"
+                                "**請點擊下方連結手動查詢 ↓**"
+                            )
+                            _mc1, _mc2, _mc3 = st.columns(3)
+                            with _mc1:
+                                st.markdown(f"🔗 [MoneyDJ 董監申報]"
+                                            f"(https://www.moneydj.com/z/zc/zck/zck_{symbol.strip()}.djhtm)")
+                            with _mc2:
+                                st.markdown(f"🔗 [MOPS 公開資訊觀測站]"
+                                            f"(https://mops.twse.com.tw/mops/web/t51sb06)")
+                            with _mc3:
+                                st.markdown(f"🔗 [GoodInfo 董監持股]"
+                                            f"(https://goodinfo.tw/tw/StockDirectorSharehold.asp?STOCK_ID={symbol.strip()})")
 
-                        st.markdown(f"""
+                        # ── 補充查詢連結（有資料時才顯示，避免與無資料提示重複）──
+                        if _has_data:
+                            st.markdown(f"""
 🔗 [MoneyDJ 董監持股明細](https://www.moneydj.com/z/zc/zck/zck_{symbol.strip()}.djhtm) ｜
 🔗 [GoodInfo 董監持股查詢](https://goodinfo.tw/tw/StockDirectorSharehold.asp?STOCK_ID={symbol.strip()}) ｜
 🔗 [MOPS 公開資訊觀測站](https://mops.twse.com.tw/mops/web/t51sb06)
