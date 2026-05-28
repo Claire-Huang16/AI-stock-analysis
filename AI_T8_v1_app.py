@@ -106,16 +106,23 @@ def get_tw_stock_price(symbol, api_key, start_date, end_date):
 
 
 def get_tw_margin_trading(symbol, api_key, start_date, end_date):
+    """
+    融資融券餘額 — FinMind TaiwanStockMarginPurchaseShortSale
+    修正：欄位大小寫容錯 + 固定近30天窗口
+    """
     try:
         url = "https://api.finmindtrade.com/api/v4/data"
+        # 固定查近30天
+        _end   = datetime.now()
+        _start = _end - timedelta(days=35)
         params = {
-            'dataset': 'TaiwanStockMarginPurchaseShortSale',
-            'data_id': symbol,
-            'start_date': start_date.strftime('%Y-%m-%d'),
-            'end_date': end_date.strftime('%Y-%m-%d'),
-            'token': api_key
+            'dataset':    'TaiwanStockMarginPurchaseShortSale',
+            'data_id':    symbol,
+            'start_date': _start.strftime('%Y-%m-%d'),
+            'end_date':   _end.strftime('%Y-%m-%d'),
+            'token':      api_key
         }
-        response = requests.get(url, params=params, timeout=20)
+        response = requests.get(url, params=params, timeout=25)
         response.raise_for_status()
         result = response.json()
         if result.get('status') != 200 or not result.get('data'):
@@ -124,22 +131,29 @@ def get_tw_margin_trading(symbol, api_key, start_date, end_date):
         df['date'] = pd.to_datetime(df['date'])
         df = df.sort_values('date').reset_index(drop=True)
 
-        margin_candidates = ['MarginPurchaseRemaining', 'MarginPurchase', 'margin_purchase_remaining', 'FundingRemaining']
-        short_candidates  = ['ShortSaleRemaining', 'ShortSale', 'short_sale_remaining', 'ShortRemaining']
+        col_lower = {c.lower(): c for c in df.columns}
 
-        def find_col(df_cols, candidates):
+        def _find(candidates):
             for c in candidates:
-                if c in df_cols:
-                    return c
-            lower_cols = {c.lower(): c for c in df_cols}
-            for keyword in ['marginpurchaseremaining', 'marginpurchase', 'shortsaleremaining', 'shortsale']:
-                for lc, orig in lower_cols.items():
-                    if keyword in lc:
-                        return orig
+                if c in df.columns: return c
+                if c.lower() in col_lower: return col_lower[c.lower()]
             return None
 
-        margin_col = find_col(df.columns.tolist(), margin_candidates)
-        short_col  = find_col(df.columns.tolist(), short_candidates)
+        margin_col = _find([
+            'MarginPurchaseRemaining','marginpurchaseremaining',
+            'MarginPurchaseToday','marginpurchasetoday',
+            'margin_purchase_remaining','FundingRemaining'
+        ])
+        short_col = _find([
+            'ShortSaleRemaining','shortsaleremaining',
+            'ShortSaleToday','shortsaletoday',
+            'short_sale_remaining','ShortRemaining'
+        ])
+        # 新增：買進/賣出欄位（供散戶籌碼比計算）
+        margin_buy_col  = _find(['MarginPurchaseBuy','marginpurchasebuy'])
+        margin_sell_col = _find(['MarginPurchaseSell','marginpurchasesell'])
+        short_buy_col   = _find(['ShortSaleBuy','shortsalebuy'])
+        short_sell_col  = _find(['ShortSaleSell','shortsalesell'])
 
         if margin_col is None and short_col is None:
             return None
@@ -149,10 +163,16 @@ def get_tw_margin_trading(symbol, api_key, start_date, end_date):
             rename_map[margin_col] = 'MarginPurchaseRemaining'
         if short_col and short_col != 'ShortSaleRemaining':
             rename_map[short_col] = 'ShortSaleRemaining'
+        if margin_buy_col  and margin_buy_col  != 'MarginPurchaseBuy':  rename_map[margin_buy_col]  = 'MarginPurchaseBuy'
+        if margin_sell_col and margin_sell_col != 'MarginPurchaseSell': rename_map[margin_sell_col] = 'MarginPurchaseSell'
+        if short_buy_col   and short_buy_col   != 'ShortSaleBuy':       rename_map[short_buy_col]   = 'ShortSaleBuy'
+        if short_sell_col  and short_sell_col  != 'ShortSaleSell':      rename_map[short_sell_col]  = 'ShortSaleSell'
         if rename_map:
             df = df.rename(columns=rename_map)
 
-        for col in ['MarginPurchaseRemaining', 'ShortSaleRemaining']:
+        for col in ['MarginPurchaseRemaining','ShortSaleRemaining',
+                    'MarginPurchaseBuy','MarginPurchaseSell',
+                    'ShortSaleBuy','ShortSaleSell']:
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors='coerce')
         return df
@@ -161,28 +181,76 @@ def get_tw_margin_trading(symbol, api_key, start_date, end_date):
 
 
 def get_tw_institutional(symbol, api_key, start_date, end_date):
+    """
+    三大法人買賣超 — FinMind TaiwanStockInstitutionalInvestorsBuySell
+    修正：
+    - 欄位名稱大小寫容錯（Buy/buy、Sell/sell、buy_volume 等）
+    - 固定查近30天，不受K線日期範圍限制
+    - 保留 buy_volume / sell_volume（千股）欄位供後續籌碼分析用
+    """
     try:
         url = "https://api.finmindtrade.com/api/v4/data"
+        # 固定查近30天（不受K線日期範圍影響）
+        _end   = datetime.now()
+        _start = _end - timedelta(days=35)   # 多抓5天保留交易日空缺
         params = {
-            'dataset': 'TaiwanStockInstitutionalInvestorsBuySell',
-            'data_id': symbol,
-            'start_date': start_date.strftime('%Y-%m-%d'),
-            'end_date': end_date.strftime('%Y-%m-%d'),
-            'token': api_key
+            'dataset':    'TaiwanStockInstitutionalInvestorsBuySell',
+            'data_id':    symbol,
+            'start_date': _start.strftime('%Y-%m-%d'),
+            'end_date':   _end.strftime('%Y-%m-%d'),
+            'token':      api_key
         }
-        response = requests.get(url, params=params, timeout=20)
+        response = requests.get(url, params=params, timeout=25)
         response.raise_for_status()
         result = response.json()
-        if result.get('status') != 200 or not result.get('data'):
+
+        # FinMind 付費 token 失效或 status 非 200
+        if result.get('status') != 200:
             return None
+        if not result.get('data'):
+            return None
+
         df = pd.DataFrame(result['data'])
         df['date'] = pd.to_datetime(df['date'])
-        for col in ['buy', 'sell']:
-            if col in df.columns:
-                df[col] = pd.to_numeric(df[col], errors='coerce').fillna(0)
-        df['net'] = df['buy'] - df['sell']
+
+        # ── 欄位名稱容錯（FinMind 不同版本欄位大小寫不一）──
+        col_lower = {c.lower(): c for c in df.columns}
+
+        def _find(candidates):
+            for c in candidates:
+                if c in df.columns:
+                    return c
+                if c.lower() in col_lower:
+                    return col_lower[c.lower()]
+            return None
+
+        buy_col  = _find(['buy', 'Buy', 'buy_volume',  'BuyVolume',  'buy_amount'])
+        sell_col = _find(['sell','Sell','sell_volume', 'SellVolume', 'sell_amount'])
+
+        if buy_col is None or sell_col is None:
+            # 嘗試從所有數值欄中找（通常第3、4欄是buy/sell）
+            num_cols = df.select_dtypes(include='number').columns.tolist()
+            num_cols = [c for c in num_cols if 'date' not in c.lower()]
+            if len(num_cols) >= 2:
+                buy_col, sell_col = num_cols[0], num_cols[1]
+            else:
+                return None
+
+        df = df.rename(columns={buy_col: 'buy', sell_col: 'sell'})
+        df['buy']  = pd.to_numeric(df['buy'],  errors='coerce').fillna(0)
+        df['sell'] = pd.to_numeric(df['sell'], errors='coerce').fillna(0)
+        df['net']  = df['buy'] - df['sell']
+
+        # 保留 name 欄（法人類別）
+        name_col = _find(['name', 'Name', 'institutional_investors'])
+        if name_col and name_col != 'name':
+            df = df.rename(columns={name_col: 'name'})
+        elif 'name' not in df.columns:
+            df['name'] = 'Unknown'
+
         df = df.sort_values('date').reset_index(drop=True)
         return df
+
     except Exception:
         return None
 
@@ -3016,7 +3084,238 @@ if analyze_button:
                         if fin_chart:
                             st.plotly_chart(fin_chart, use_container_width=True)
 
-                    # ── 顯示 8：內部人買賣儀表板（MoneyDJ 近3月 + MOPS 年度申報）──
+                    # ── 顯示 9（台股）：籌碼面分析（T09規格第9項）──
+                    if is_tw:
+                        st.markdown("### 🧩 籌碼面分析（三大法人 ＋ 主力分點 ＋ 散戶籌碼比）")
+                        st.caption("📡 資料來源：FinMind TaiwanStockInstitutionalInvestorsBuySell / TaiwanStockTradingDailyReport / TaiwanStockMarginPurchaseShortSale")
+
+                        _chip_tab1, _chip_tab2, _chip_tab3, _chip_tab4 = st.tabs([
+                            "🏦 三大法人30日", "🏢 主力分點進出", "📊 散戶籌碼比", "📈 走勢總圖"
+                        ])
+
+                        # ─── 頁籤1：三大法人30天詳細 ─────────────────
+                        with _chip_tab1:
+                            if institutional_df is not None and len(institutional_df) > 0:
+                                _inst = institutional_df.copy()
+
+                                # 法人名稱中文化
+                                _name_map = {
+                                    'Foreign_Investor':  '外資',
+                                    'Investment_Trust':  '投信',
+                                    'Dealer_self':       '自營商(自行)',
+                                    'Dealer_Hedging':    '自營商(避險)',
+                                    'Dealer':            '自營商',
+                                    'Total':             '三大法人合計',
+                                }
+                                if 'name' in _inst.columns:
+                                    _inst['法人'] = _inst['name'].map(_name_map).fillna(_inst['name'])
+
+                                # ── 統計卡：外資/投信/自營累計買賣超 ──
+                                _inst30 = _inst[_inst['date'] >= (datetime.now() - timedelta(days=30))]
+                                _summ_rows = []
+                                for _eng, _chn in [('Foreign_Investor','外資'),
+                                                    ('Investment_Trust','投信'),
+                                                    ('Dealer_self','自營商(自行)'),
+                                                    ('Dealer_Hedging','自營商(避險)'),
+                                                    ('Total','三大法人合計')]:
+                                    _sub = _inst30[_inst30['name'] == _eng] if 'name' in _inst30.columns else pd.DataFrame()
+                                    if not _sub.empty:
+                                        _net_sum  = int(_sub['net'].sum())
+                                        _buy_sum  = int(_sub['buy'].sum())
+                                        _sell_sum = int(_sub['sell'].sum())
+                                        # 連買/連賣天數
+                                        _nets = _sub.sort_values('date')['net'].tolist()
+                                        _streak = 0
+                                        for _v in reversed(_nets):
+                                            if _v > 0: _streak += 1
+                                            else: break
+                                        _streak_str = f"連買{_streak}天" if _streak >= 2 else (
+                                                       f"連賣{abs(_streak)}天" if _streak < 0 else "")
+                                        _summ_rows.append({
+                                            '法人': _chn,
+                                            '30日淨買超(張)': f"{_net_sum:+,}",
+                                            '買進合計(張)': f"{_buy_sum:,}",
+                                            '賣出合計(張)': f"{_sell_sum:,}",
+                                            '連續狀態': _streak_str,
+                                            '方向': '🟢 買超' if _net_sum > 0 else ('🔴 賣超' if _net_sum < 0 else '⚪ 持平'),
+                                        })
+                                if _summ_rows:
+                                    _summ_df = pd.DataFrame(_summ_rows)
+                                    st.dataframe(_summ_df, use_container_width=True, hide_index=True)
+
+                                # ── 近10交易日逐日明細（pivot 表）──
+                                st.markdown("##### 近10交易日逐日買賣超（張）")
+                                display_institutional_table(institutional_df)
+
+                                # ── 外資買超佔比分析 ──
+                                if 'name' in _inst30.columns:
+                                    _foreign = _inst30[_inst30['name'] == 'Foreign_Investor']
+                                    if not _foreign.empty and 'volume' in data_with_indicators.columns:
+                                        _avg_vol = data_with_indicators.tail(30)['volume'].mean()
+                                        _foreign_net_avg = abs(_foreign['net']).mean()
+                                        if _avg_vol > 0:
+                                            _pct = _foreign_net_avg / _avg_vol * 100
+                                            _label = "🟢 主動推升" if _pct > 20 else "⚪ 正常"
+                                            st.info(f"外資買超佔成交量比重：約 **{_pct:.1f}%**（> 20% 視為主動推升）{_label}")
+                            else:
+                                st.warning("⚠️ 三大法人資料取得失敗，請確認 FinMind API Key 是否為付費 Backer 以上方案。")
+                                st.markdown(f"🔗 [手動查詢三大法人](https://goodinfo.tw/tw/StockBuySaleByLegalPerson.asp?STOCK_ID={symbol.strip()})")
+
+                        # ─── 頁籤2：主力券商分點 ─────────────────────
+                        with _chip_tab2:
+                            if broker_df is not None:
+                                _src_broker = broker_df.get('source', 'TWSE') if isinstance(broker_df, dict) else 'TWSE'
+                                st.caption(f"📡 資料來源：{_src_broker} | 查詢日期：{broker_date}")
+
+                                # 主力特徵判斷
+                                if isinstance(broker_df, dict):
+                                    _buy_df  = broker_df.get('buy_df', pd.DataFrame())
+                                    _sell_df = broker_df.get('sell_df', pd.DataFrame())
+                                    _tb = broker_df.get('total_buy', 0)
+                                    _ts = broker_df.get('total_sell', 0)
+                                else:
+                                    _buy_df  = broker_df[broker_df.get('net', 0) > 0] if 'net' in broker_df.columns else pd.DataFrame()
+                                    _sell_df = broker_df[broker_df.get('net', 0) < 0] if 'net' in broker_df.columns else pd.DataFrame()
+                                    _tb = int(broker_df['buy'].sum()) if 'buy' in broker_df.columns else 0
+                                    _ts = int(broker_df['sell'].sum()) if 'sell' in broker_df.columns else 0
+
+                                _c1, _c2, _c3 = st.columns(3)
+                                with _c1: st.metric("主力買超分點數", f"{len(_buy_df)} 家")
+                                with _c2: st.metric("主力賣超分點數", f"{len(_sell_df)} 家")
+                                with _c3:
+                                    _tv = _tb + _ts
+                                    if not _buy_df.empty and _tv > 0 and 'buy' in _buy_df.columns and 'sell' in _buy_df.columns:
+                                        _top1_vol = int(_buy_df.iloc[0]['buy']) + int(_buy_df.iloc[0]['sell']) if len(_buy_df) > 0 else 0
+                                        _conc = _top1_vol / _tv * 100
+                                        st.metric("主力最大分點集中度", f"{_conc:.1f}%",
+                                                  delta="⚠️ 主力介入" if _conc > 10 else "⚪ 正常")
+
+                                st.markdown("##### 主力淨買超前10大分點")
+                                display_broker_table(broker_df, symbol.strip(), query_date=broker_date)
+                            else:
+                                st.warning("⚠️ 券商分點資料暫無（可能為非交易日或資料尚未更新）")
+                                st.markdown(f"🔗 [GoodInfo 主力進出](https://goodinfo.tw/tw/StockBuySaleByBroker.asp?STOCK_ID={symbol.strip()})")
+
+                        # ─── 頁籤3：散戶籌碼比 ───────────────────────
+                        with _chip_tab3:
+                            if margin_df is not None and len(margin_df) > 0:
+                                _mg = margin_df.copy()
+                                _latest = _mg.iloc[-1]
+                                _prev30 = _mg.iloc[0]
+
+                                _margin_now   = _latest.get('MarginPurchaseRemaining', 0) or 0
+                                _margin_prev  = _prev30.get('MarginPurchaseRemaining', 0) or 0
+                                _short_now    = _latest.get('ShortSaleRemaining', 0) or 0
+                                _short_prev   = _prev30.get('ShortSaleRemaining', 0) or 0
+                                _margin_chg   = _margin_now - _margin_prev
+                                _short_chg    = _short_now  - _short_prev
+                                _margin_chg_p = (_margin_chg / _margin_prev * 100) if _margin_prev > 0 else 0
+                                _short_chg_p  = (_short_chg  / _short_prev  * 100) if _short_prev  > 0 else 0
+                                _yuan_bi      = (_short_now / _margin_now * 100) if _margin_now > 0 else 0
+
+                                # 散戶健康度判斷
+                                _health_score = 0
+                                if _margin_chg < 0: _health_score += 1   # 融資減：去槓桿，好
+                                if _short_chg  > 0: _health_score += 1   # 融券增：軋空潛力，好
+                                if _yuan_bi    > 15: _health_score += 1  # 券資比高：軋空題材
+                                _health_label = {0:"🔴 籌碼不乾淨", 1:"🟡 中性", 2:"🟢 籌碼健康", 3:"🟢🟢 籌碼最乾淨"}[_health_score]
+
+                                _mc1, _mc2, _mc3, _mc4 = st.columns(4)
+                                with _mc1:
+                                    st.metric("融資餘額(張)", f"{int(_margin_now):,}",
+                                              delta=f"{_margin_chg_p:+.1f}% 30日",
+                                              delta_color="inverse")   # 融資減是好事，顏色反轉
+                                with _mc2:
+                                    st.metric("融券餘額(張)", f"{int(_short_now):,}",
+                                              delta=f"{_short_chg_p:+.1f}% 30日",
+                                              delta_color="normal")
+                                with _mc3:
+                                    st.metric("券資比", f"{_yuan_bi:.1f}%",
+                                              delta="軋空題材" if _yuan_bi > 15 else "正常",
+                                              delta_color="normal" if _yuan_bi > 15 else "off")
+                                with _mc4:
+                                    st.metric("散戶健康度", _health_label)
+
+                                # 融資融券走勢圖
+                                _fig_mg = go.Figure()
+                                _fig_mg.add_trace(go.Scatter(
+                                    x=_mg['date'], y=_mg['MarginPurchaseRemaining'],
+                                    name='融資餘額(張)', line=dict(color='#E24B4A', width=1.5),
+                                    hovertemplate='%{x|%Y-%m-%d}<br>融資：%{y:,}張<extra></extra>'
+                                ))
+                                if 'ShortSaleRemaining' in _mg.columns:
+                                    _fig_mg.add_trace(go.Scatter(
+                                        x=_mg['date'], y=_mg['ShortSaleRemaining'],
+                                        name='融券餘額(張)', line=dict(color='#378ADD', width=1.5, dash='dot'),
+                                        yaxis='y2',
+                                        hovertemplate='%{x|%Y-%m-%d}<br>融券：%{y:,}張<extra></extra>'
+                                    ))
+                                _fig_mg.update_layout(
+                                    title=f"{symbol.strip()} 融資融券餘額（近30天）",
+                                    xaxis_title="日期", yaxis_title="融資餘額(張)",
+                                    yaxis2=dict(title="融券餘額(張)", overlaying='y', side='right'),
+                                    height=300, hovermode='x unified',
+                                    plot_bgcolor='rgba(0,0,0,0)', paper_bgcolor='rgba(0,0,0,0)',
+                                    legend=dict(orientation='h', y=1.05),
+                                    margin=dict(l=50,r=50,t=50,b=40)
+                                )
+                                st.plotly_chart(_fig_mg, use_container_width=True)
+
+                                # 明細表格
+                                _mg_disp = _mg.tail(10)[['date'] + [c for c in [
+                                    'MarginPurchaseRemaining','ShortSaleRemaining',
+                                    'MarginPurchaseBuy','MarginPurchaseSell',
+                                    'ShortSaleBuy','ShortSaleSell'
+                                ] if c in _mg.columns]].copy()
+                                _mg_disp.rename(columns={
+                                    'date':'日期',
+                                    'MarginPurchaseRemaining':'融資餘額',
+                                    'ShortSaleRemaining':'融券餘額',
+                                    'MarginPurchaseBuy':'融資買進',
+                                    'MarginPurchaseSell':'融資賣出',
+                                    'ShortSaleBuy':'融券買進(回補)',
+                                    'ShortSaleSell':'融券賣出',
+                                }, inplace=True)
+                                _mg_disp['日期'] = pd.to_datetime(_mg_disp['日期']).dt.strftime('%Y-%m-%d')
+                                st.dataframe(_mg_disp, use_container_width=True, hide_index=True)
+                            else:
+                                st.warning("⚠️ 融資融券資料取得失敗，請確認 FinMind API Key。")
+                                st.markdown(f"🔗 [手動查詢融資融券](https://goodinfo.tw/tw/StockMarginTrading.asp?STOCK_ID={symbol.strip()})")
+
+                        # ─── 頁籤4：三大法人走勢總圖 ─────────────────
+                        with _chip_tab4:
+                            if institutional_df is not None and len(institutional_df) > 0:
+                                _inst_plot = institutional_df.copy()
+                                _inst_plot['date'] = pd.to_datetime(_inst_plot['date'])
+
+                                _fig_chip = go.Figure()
+                                _color_map = {
+                                    'Foreign_Investor':  ('#185FA5','外資'),
+                                    'Investment_Trust':  ('#1D9E75','投信'),
+                                    'Dealer_self':       ('#BA7517','自營商(自行)'),
+                                }
+                                for _eng, (_clr, _chn) in _color_map.items():
+                                    _sub = _inst_plot[_inst_plot['name'] == _eng] if 'name' in _inst_plot.columns else pd.DataFrame()
+                                    if not _sub.empty:
+                                        _fig_chip.add_trace(go.Bar(
+                                            x=_sub['date'], y=_sub['net'],
+                                            name=_chn, marker_color=_clr, opacity=0.8,
+                                            hovertemplate=f'{_chn} %{{x|%Y-%m-%d}}<br>買賣超：%{{y:,}}張<extra></extra>'
+                                        ))
+                                _fig_chip.update_layout(
+                                    title=f"{symbol.strip()} 三大法人買賣超走勢（近30天）",
+                                    barmode='group', xaxis_title='日期', yaxis_title='買賣超(張)',
+                                    height=360, hovermode='x unified',
+                                    plot_bgcolor='rgba(0,0,0,0)', paper_bgcolor='rgba(0,0,0,0)',
+                                    legend=dict(orientation='h', y=1.05),
+                                    margin=dict(l=50,r=20,t=50,b=40)
+                                )
+                                _fig_chip.add_hline(y=0, line_dash='dash', line_color='gray', line_width=1)
+                                st.plotly_chart(_fig_chip, use_container_width=True)
+                            else:
+                                st.info("ℹ️ 無三大法人資料可繪製走勢圖")
+
+
                     if is_tw:
                         st.markdown("### 🔍 內部人買賣分析（MoneyDJ + MOPS 雙來源）")
 
