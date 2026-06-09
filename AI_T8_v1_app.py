@@ -15,6 +15,55 @@ try:
 except ImportError:
     _BS4_OK = False
 
+# twstock：台股公司名稱本地查詢（T03 整合）
+try:
+    import twstock as _twstock
+    _TW_CODES = _twstock.codes
+    _USE_TWSTOCK = True
+except ImportError:
+    _TW_CODES = {}
+    _USE_TWSTOCK = False
+
+# ─────────────────────────────────────────────
+# 交易類型字典（T03 整合）
+# ─────────────────────────────────────────────
+
+# 美股 SEC Form 4 交易代碼
+TRANSACTION_CODES = {
+    'P-Purchase':      {'中文': '公開市場購買',  '價值': '⭐⭐⭐⭐⭐', '類別': '一般交易代碼',            '說明': '用真金白銀買入 - 最強看好信號'},
+    'S-Sale':          {'中文': '公開市場出售',  '價值': '⭐⭐',     '類別': '一般交易代碼',            '說明': '需結合其他交易判斷'},
+    'V-Voluntary':     {'中文': '自願提前申報',  '價值': 'ℹ️',      '類別': '一般交易代碼',            '說明': '僅表示申報時間'},
+    'A-Award':         {'中文': '獎勵授予',      '價值': '⭐',      '類別': 'Rule 16b-3 豁免',         '說明': '薪酬計劃無分析價值'},
+    'D-Return':        {'中文': '回售公司',      '價值': '⭐',      '類別': 'Rule 16b-3 豁免',         '說明': '技術性交易'},
+    'F-InKind':        {'中文': '以股支付',      '價值': '⭐',      '類別': 'Rule 16b-3 豁免',         '說明': '常與M和S組合出現'},
+    'I-Discretionary': {'中文': '全權委託交易',  '價值': '⭐⭐',    '類別': 'Rule 16b-3 豁免',         '說明': '可能有意義需查看上下文'},
+    'M-Exempt':        {'中文': '行權/轉換豁免', '價值': '⭐',      '類別': 'Rule 16b-3 豁免',         '說明': '薪酬計劃到期'},
+    'C-Conversion':    {'中文': '衍生品轉換',    '價值': '⭐',      '類別': '衍生證券代碼',            '說明': '技術性操作'},
+    'E-ExpireShort':   {'中文': '空頭部位到期',  '價值': '⭐',      '類別': '衍生證券代碼',            '說明': '技術性操作'},
+    'H-ExpireLong':    {'中文': '多頭部位到期',  '價值': '⭐',      '類別': '衍生證券代碼',            '說明': '技術性操作'},
+    'O-OutOfTheMoney': {'中文': '價外行權',      '價值': '⭐',      '類別': '衍生證券代碼',            '說明': '罕見情況'},
+    'X-InTheMoney':    {'中文': '價內行權',      '價值': '⭐⭐',    '類別': '衍生證券代碼',            '說明': '正常行權操作'},
+    'G-Gift':          {'中文': '贈與',          '價值': '❌',      '類別': '其他Section 16(b)豁免',   '說明': '無投資價值'},
+    'L-Small':         {'中文': '小額收購',      '價值': '⭐',      '類別': '其他Section 16(b)豁免',   '說明': '金額太小通常忽略'},
+    'W-Will':          {'中文': '遺囑/繼承',     '價值': '❌',      '類別': '其他Section 16(b)豁免',   '說明': '無投資價值'},
+    'Z-Trust':         {'中文': '信託操作',      '價值': '⭐',      '類別': '其他Section 16(b)豁免',   '說明': '技術性操作'},
+    'J-Other':         {'中文': '其他交易',      '價值': '❓',      '類別': '特殊交易代碼',            '說明': '需要查看註腳'},
+    'K-Swap':          {'中文': '股權互換',      '價值': '⭐⭐',    '類別': '特殊交易代碼',            '說明': '複雜金融操作'},
+    'U-Tender':        {'中文': '要約收購',      '價值': '⭐⭐⭐',  '類別': '特殊交易代碼',            '說明': '公司併購相關'},
+}
+
+# 台股董監事申報類型
+TW_TRANSACTION_TYPES = {
+    '買進':       {'說明': '董監事於公開市場買進股票 - 看好信號',      '價值': '⭐⭐⭐⭐⭐'},
+    '賣出':       {'說明': '董監事於公開市場賣出股票 - 需結合背景判斷', '價值': '⭐⭐'},
+    '轉讓':       {'說明': '股份轉讓（非公開市場），如贈與或信託',      '價值': '⭐'},
+    '受讓':       {'說明': '接受股份轉讓',                            '價值': '⭐'},
+    '認購':       {'說明': '參與現金增資認購新股',                    '價值': '⭐⭐⭐'},
+    '行使認股權': {'說明': '行使員工認股權',                          '價值': '⭐'},
+    '設定質押':   {'說明': '股份設定質押借款 - 注意財務壓力風險',      '價值': '⚠️'},
+    '解除質押':   {'說明': '解除股份質押 - 財務壓力減輕',             '價值': 'ℹ️'},
+}
+
 # 設置頁面配置
 st.set_page_config(
     page_title="AI 股票趨勢分析系統",
@@ -60,8 +109,291 @@ def get_us_stock_data(symbol, api_key, start_date, end_date):
 
 
 # ─────────────────────────────────────────────
+# 美股內部人深度查詢（T03 整合）
+# ─────────────────────────────────────────────
+
+@st.cache_data(ttl=3600)
+def get_company_profile(symbol, api_key):
+    """美股公司基本資料（FMP /stable/ 端點）"""
+    url = f"https://financialmodelingprep.com/stable/profile?symbol={symbol}&apikey={api_key}"
+    try:
+        resp = requests.get(url, timeout=10)
+        data = resp.json()
+        return data[0] if data and len(data) > 0 else None
+    except Exception as e:
+        st.error(f"獲取公司資料失敗: {str(e)}")
+        return None
+
+
+@st.cache_data(ttl=1800)
+def get_insider_trading_by_symbol(symbol, api_key):
+    """美股公司所有內部人 SEC Form 4 申報（FMP /stable/ 端點）"""
+    url = (f"https://financialmodelingprep.com/stable/insider-trading/search"
+           f"?symbol={symbol}&page=0&limit=100&apikey={api_key}")
+    try:
+        resp = requests.get(url, timeout=15)
+        data = resp.json()
+        return data if data and isinstance(data, list) else []
+    except Exception as e:
+        st.error(f"獲取內部人交易資料失敗: {str(e)}")
+        return []
+
+
+@st.cache_data(ttl=1800)
+def get_insider_trading_by_cik(cik, api_key):
+    """依內部人 CIK 查詢跨公司交易（FMP /stable/ 端點）"""
+    url = (f"https://financialmodelingprep.com/stable/insider-trading/search"
+           f"?reportingCik={cik}&page=0&limit=100&apikey={api_key}")
+    try:
+        resp = requests.get(url, timeout=15)
+        data = resp.json()
+        return data if data and isinstance(data, list) else []
+    except Exception as e:
+        st.error(f"獲取內部人交易資料失敗: {str(e)}")
+        return []
+
+
+def process_insider_data(raw_data):
+    """處理美股內部人交易數據，標準化為 DataFrame（url → SEC_URL）"""
+    if not raw_data:
+        return pd.DataFrame()
+    processed = []
+    for trade in raw_data:
+        tv = trade.get('securitiesTransacted', 0) * trade.get('price', 0)
+        processed.append({
+            '交易日期':   trade.get('transactionDate', ''),
+            '股票代碼':   trade.get('symbol', ''),
+            '內部人姓名': trade.get('reportingName', ''),
+            '內部人代碼': trade.get('reportingCik', ''),
+            '職位':       trade.get('typeOfOwner', ''),
+            '交易類型':   trade.get('transactionType', ''),
+            '交易股數':   trade.get('securitiesTransacted', 0),
+            '交易價格':   trade.get('price', 0),
+            '交易金額':   tv,
+            '交易後持股': trade.get('securitiesOwned', 0),
+            'SEC_URL':    trade.get('url', ''),
+        })
+    df = pd.DataFrame(processed)
+    if not df.empty and '交易日期' in df.columns:
+        df = df.sort_values('交易日期', ascending=False)
+    return df
+
+
+def create_transaction_table(df):
+    """美股交易表格格式化（千分位 + 貨幣）"""
+    if df.empty:
+        return pd.DataFrame()
+    d = df.copy()
+    def _fmt_n(v):
+        try: return f"{int(v):,}"
+        except: return str(v)
+    def _fmt_c(v):
+        try: return f"${v:,.2f}"
+        except: return str(v)
+    d['交易股數']   = d['交易股數'].apply(_fmt_n)
+    d['交易價格']   = d['交易價格'].apply(_fmt_c)
+    d['交易金額']   = d['交易金額'].apply(_fmt_c)
+    d['交易後持股'] = d['交易後持股'].apply(_fmt_n)
+    return d[['交易日期','股票代碼','內部人姓名','內部人代碼','職位',
+              '交易類型','交易股數','交易價格','交易金額','交易後持股','SEC_URL']]
+
+
+# ─────────────────────────────────────────────
 # 台股數據函數
 # ─────────────────────────────────────────────
+
+def _finmind_headers(token):
+    """FinMind v4 正確驗證方式：Authorization Bearer header"""
+    return {"Authorization": f"Bearer {token}"}
+
+
+@st.cache_data(ttl=3600)
+def get_tw_company_profile(stock_code):
+    """台股公司名稱與產業（twstock 本地資料庫，不需網路）"""
+    profile = {"stockCode": stock_code, "companyName": stock_code,
+               "industry": "", "market": "台股"}
+    if _USE_TWSTOCK:
+        info = _TW_CODES.get(stock_code)
+        if info:
+            profile["companyName"] = info.name
+            profile["industry"]    = getattr(info, "group", "")
+            profile["market"]      = getattr(info, "market", "台股")
+    return profile
+
+
+@st.cache_data(ttl=1800)
+def get_finmind_stock_price_latest(stock_code, finmind_token):
+    """台股最新股價（TaiwanStockPrice，近10天取最後一筆）"""
+    end   = datetime.now().strftime("%Y-%m-%d")
+    start = (datetime.now() - timedelta(days=10)).strftime("%Y-%m-%d")
+    params = {"dataset": "TaiwanStockPrice", "data_id": stock_code,
+              "start_date": start, "end_date": end}
+    try:
+        resp = requests.get("https://api.finmindtrade.com/api/v4/data",
+                            headers=_finmind_headers(finmind_token),
+                            params=params, timeout=15)
+        result = resp.json()
+        if result.get("status") != 200:
+            return None
+        data = result.get("data", [])
+        if not data:
+            return None
+        df = pd.DataFrame(data)
+        return float(df["close"].iloc[-1]) if "close" in df.columns else None
+    except Exception:
+        return None
+
+
+@st.cache_data(ttl=1800)
+def get_finmind_holding_shares_per(stock_code, finmind_token, start_date="2020-01-01"):
+    """
+    股東持股分級表 TaiwanStockHoldingSharesPer（需 Backer 付費等級）
+    反映各持股區間的股東人數與持股比例，顯示籌碼集中度。
+    回傳 (DataFrame, error_msg)
+    """
+    params = {"dataset": "TaiwanStockHoldingSharesPer",
+              "data_id": stock_code, "start_date": start_date}
+    try:
+        resp = requests.get("https://api.finmindtrade.com/api/v4/data",
+                            headers=_finmind_headers(finmind_token),
+                            params=params, timeout=20)
+        resp.raise_for_status()
+        result = resp.json()
+        if result.get("status") != 200:
+            return pd.DataFrame(), f"FinMind API 錯誤：{result.get('msg', '未知錯誤')}"
+        data = result.get("data", [])
+        return (pd.DataFrame(data), None) if data else (pd.DataFrame(), None)
+    except requests.exceptions.HTTPError as e:
+        status = e.response.status_code if e.response else "?"
+        try:
+            detail = e.response.json().get("detail", "")
+        except Exception:
+            detail = ""
+        return pd.DataFrame(), f"HTTP {status}：{detail or str(e)}"
+    except Exception as e:
+        return pd.DataFrame(), str(e)
+
+
+# ── GoodInfo 爬蟲輔助（T03 整合）──────────────────────────────────────────
+
+GOODINFO_HEADERS = {
+    "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                   "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/130.0.0.0 Safari/537.36"),
+    "Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,*/*;q=0.8",
+    "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.8",
+    "Accept-Encoding": "gzip, deflate, br",
+    "Connection":      "keep-alive",
+    "Referer":         "https://goodinfo.tw/tw/index.asp",
+}
+
+
+def _goodinfo_get(url, params=None, timeout=20):
+    """GET goodinfo，回傳 (html, error)，帶 1 秒延遲避免限速"""
+    time.sleep(1)
+    try:
+        r = requests.get(url, params=params, headers=GOODINFO_HEADERS, timeout=timeout)
+        r.encoding = "utf-8"
+        if r.status_code != 200:
+            return None, f"HTTP {r.status_code}"
+        if not r.text.strip():
+            return None, "回傳空頁面"
+        return r.text, None
+    except requests.exceptions.Timeout:
+        return None, "請求逾時，請稍後再試"
+    except requests.exceptions.ConnectionError:
+        return None, "無法連線至 goodinfo.tw"
+    except Exception as e:
+        return None, str(e)
+
+
+def _parse_txtStockListData(html):
+    """解析 goodinfo StockList 頁面中 #txtStockListData 的表格"""
+    from bs4 import BeautifulSoup
+    soup = BeautifulSoup(html, "html.parser")
+    div = soup.find("div", id="txtStockListData")
+    if not div:
+        return pd.DataFrame()
+    try:
+        dfs = pd.read_html(div.prettify())
+        dfs = [df for df in dfs if df.shape[0] > 1 and df.shape[1] > 2]
+        if not dfs:
+            return pd.DataFrame()
+        df = dfs[0]
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = [" ".join(str(c) for c in col if str(c) != "Unnamed").strip()
+                          for col in df.columns]
+        df.columns = [str(c).strip() for c in df.columns]
+        return df.dropna(how="all").reset_index(drop=True)
+    except Exception:
+        return pd.DataFrame()
+
+
+def _parse_director_table(html):
+    """解析 goodinfo 個股董監持股頁面（StockDirectorSharehold）"""
+    from bs4 import BeautifulSoup
+    soup = BeautifulSoup(html, "html.parser")
+    container = (soup.find("div", id="divDetail") or
+                 soup.find("table", id="tblDetail") or
+                 soup.find("div", id="divStockDetail"))
+    target_html = container.prettify() if container else html
+    try:
+        dfs = pd.read_html(target_html)
+        dfs = [df for df in dfs if df.shape[0] > 1 and df.shape[1] > 2]
+        if not dfs:
+            tables = soup.find_all("table")
+            best = max(tables, key=lambda t: len(t.find_all("tr")), default=None)
+            if best:
+                dfs = pd.read_html(best.prettify())
+                dfs = [df for df in dfs if df.shape[0] > 1 and df.shape[1] > 2]
+        if not dfs:
+            return pd.DataFrame()
+        df = dfs[0]
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = [" ".join(str(c) for c in col if "Unnamed" not in str(c)).strip()
+                          for col in df.columns]
+        df.columns = [str(c).strip() for c in df.columns]
+        return df.dropna(how="all").reset_index(drop=True)
+    except Exception:
+        return pd.DataFrame()
+
+
+@st.cache_data(ttl=1800)
+def get_tw_insider_holdings(stock_code):
+    """goodinfo 個股董監持股明細，回傳 (DataFrame, error)"""
+    html, err = _goodinfo_get(
+        "https://goodinfo.tw/tw/StockDirectorSharehold.asp",
+        params={"STOCK_ID": stock_code}
+    )
+    if err:
+        return pd.DataFrame(), err
+    return _parse_director_table(html), None
+
+
+@st.cache_data(ttl=3600)
+def get_tw_insider_ranking(rank_range=300):
+    """goodinfo 全體上市公司董監持股排行（#txtStockListData），回傳 (DataFrame, error)"""
+    html, err = _goodinfo_get(
+        "https://goodinfo.tw/tw/StockList.asp",
+        params={
+            "MARKET_CAT": "熱門排行",
+            "INDUSTRY_CAT": "全體董監持股比例(%)@@全體董監@@持股比例(%)",
+            "SHEET": "董監持股",
+            "RPT_TIME": "最新資料",
+            "RANK_RANGE": str(rank_range),
+        }
+    )
+    if err:
+        return pd.DataFrame(), err
+    df = _parse_txtStockListData(html)
+    if df.empty:
+        try:
+            with open("/tmp/goodinfo_debug.html", "w", encoding="utf-8") as f:
+                f.write(html)
+        except Exception:
+            pass
+        return pd.DataFrame(), "解析失敗：找不到 #txtStockListData"
+    return df, None
+
 
 def get_tw_stock_price(symbol, api_key, start_date, end_date):
     try:
@@ -108,11 +440,18 @@ def get_tw_stock_price(symbol, api_key, start_date, end_date):
 def get_tw_margin_trading(symbol, api_key, start_date, end_date):
     """
     融資融券餘額 — FinMind TaiwanStockMarginPurchaseShortSale
-    修正：欄位大小寫容錯 + 固定近30天窗口
+
+    FinMind 官方實際欄位名稱（v4 API）：
+      MarginPurchaseTodayBalance  ← 融資餘額（張）★ 修正
+      ShortSaleTodayBalance       ← 融券餘額（張）★ 修正
+      MarginPurchaseBuy           ← 融資買進
+      MarginPurchaseSell          ← 融資賣出
+      ShortSaleBuy                ← 融券買進(回補)
+      ShortSaleSell               ← 融券賣出
+    統一重命名為 MarginPurchaseRemaining / ShortSaleRemaining 供後續顯示邏輯使用。
     """
     try:
         url = "https://api.finmindtrade.com/api/v4/data"
-        # 固定查近30天
         _end   = datetime.now()
         _start = _end - timedelta(days=35)
         params = {
@@ -125,8 +464,12 @@ def get_tw_margin_trading(symbol, api_key, start_date, end_date):
         response = requests.get(url, params=params, timeout=25)
         response.raise_for_status()
         result = response.json()
-        if result.get('status') != 200 or not result.get('data'):
+
+        if result.get('status') != 200:
             return None
+        if not result.get('data'):
+            return None
+
         df = pd.DataFrame(result['data'])
         df['date'] = pd.to_datetime(df['date'])
         df = df.sort_values('date').reset_index(drop=True)
@@ -135,44 +478,56 @@ def get_tw_margin_trading(symbol, api_key, start_date, end_date):
 
         def _find(candidates):
             for c in candidates:
-                if c in df.columns: return c
-                if c.lower() in col_lower: return col_lower[c.lower()]
+                if c in df.columns:
+                    return c
+                if c.lower() in col_lower:
+                    return col_lower[c.lower()]
             return None
 
+        # ★ 修正：優先使用 FinMind 官方正確欄位名 TodayBalance
         margin_col = _find([
-            'MarginPurchaseRemaining','marginpurchaseremaining',
-            'MarginPurchaseToday','marginpurchasetoday',
-            'margin_purchase_remaining','FundingRemaining'
+            'MarginPurchaseTodayBalance',   # FinMind v4 官方欄位 ★
+            'MarginPurchaseRemaining',       # 相容舊命名
+            'MarginPurchaseToday',
+            'margin_purchase_remaining',
+            'FundingRemaining',
         ])
         short_col = _find([
-            'ShortSaleRemaining','shortsaleremaining',
-            'ShortSaleToday','shortsaletoday',
-            'short_sale_remaining','ShortRemaining'
+            'ShortSaleTodayBalance',         # FinMind v4 官方欄位 ★
+            'ShortSaleRemaining',            # 相容舊命名
+            'ShortSaleToday',
+            'short_sale_remaining',
+            'ShortRemaining',
         ])
-        # 新增：買進/賣出欄位（供散戶籌碼比計算）
-        margin_buy_col  = _find(['MarginPurchaseBuy','marginpurchasebuy'])
-        margin_sell_col = _find(['MarginPurchaseSell','marginpurchasesell'])
-        short_buy_col   = _find(['ShortSaleBuy','shortsalebuy'])
-        short_sell_col  = _find(['ShortSaleSell','shortsalesell'])
+        # 買進/賣出欄位（散戶籌碼比計算用）
+        margin_buy_col  = _find(['MarginPurchaseBuy',  'marginpurchasebuy'])
+        margin_sell_col = _find(['MarginPurchaseSell', 'marginpurchasesell'])
+        short_buy_col   = _find(['ShortSaleBuy',       'shortsalebuy'])
+        short_sell_col  = _find(['ShortSaleSell',      'shortsalesell'])
 
         if margin_col is None and short_col is None:
             return None
 
+        # 統一重命名為固定欄位名，後續顯示邏輯不需改動
         rename_map = {}
         if margin_col and margin_col != 'MarginPurchaseRemaining':
             rename_map[margin_col] = 'MarginPurchaseRemaining'
         if short_col and short_col != 'ShortSaleRemaining':
             rename_map[short_col] = 'ShortSaleRemaining'
-        if margin_buy_col  and margin_buy_col  != 'MarginPurchaseBuy':  rename_map[margin_buy_col]  = 'MarginPurchaseBuy'
-        if margin_sell_col and margin_sell_col != 'MarginPurchaseSell': rename_map[margin_sell_col] = 'MarginPurchaseSell'
-        if short_buy_col   and short_buy_col   != 'ShortSaleBuy':       rename_map[short_buy_col]   = 'ShortSaleBuy'
-        if short_sell_col  and short_sell_col  != 'ShortSaleSell':      rename_map[short_sell_col]  = 'ShortSaleSell'
+        if margin_buy_col  and margin_buy_col  != 'MarginPurchaseBuy':
+            rename_map[margin_buy_col]  = 'MarginPurchaseBuy'
+        if margin_sell_col and margin_sell_col != 'MarginPurchaseSell':
+            rename_map[margin_sell_col] = 'MarginPurchaseSell'
+        if short_buy_col   and short_buy_col   != 'ShortSaleBuy':
+            rename_map[short_buy_col]   = 'ShortSaleBuy'
+        if short_sell_col  and short_sell_col  != 'ShortSaleSell':
+            rename_map[short_sell_col]  = 'ShortSaleSell'
         if rename_map:
             df = df.rename(columns=rename_map)
 
-        for col in ['MarginPurchaseRemaining','ShortSaleRemaining',
-                    'MarginPurchaseBuy','MarginPurchaseSell',
-                    'ShortSaleBuy','ShortSaleSell']:
+        for col in ['MarginPurchaseRemaining', 'ShortSaleRemaining',
+                    'MarginPurchaseBuy', 'MarginPurchaseSell',
+                    'ShortSaleBuy', 'ShortSaleSell']:
             if col in df.columns:
                 df[col] = pd.to_numeric(df[col], errors='coerce')
         return df
@@ -3487,11 +3842,141 @@ if analyze_button:
 🔗 [GoodInfo 董監持股查詢](https://goodinfo.tw/tw/StockDirectorSharehold.asp?STOCK_ID={symbol.strip()}) ｜
 🔗 [MOPS 公開資訊觀測站](https://mops.twse.com.tw/mops/web/t51sb06)
 """)
+
+                    # ── T03 整合：台股股東持股分級 + GoodInfo 查詢 ────────────
+                    if is_tw:
+                        st.markdown("### 🧬 股東持股分級 & GoodInfo 董監持股（T03 延伸分析）")
+                        _t03_tab1, _t03_tab2, _t03_tab3 = st.tabs([
+                            "📊 股東持股分級（籌碼）",
+                            "🏛️ GoodInfo 個股董監持股",
+                            "📚 台股申報類型說明"
+                        ])
+
+                        with _t03_tab1:
+                            st.caption("資料來源：FinMind TaiwanStockHoldingSharesPer（需 Backer 付費等級）")
+                            _h_year = datetime.now().year - 3
+                            with st.spinner(f"正在取得 {symbol.strip()} 股東持股分級..."):
+                                _df_hold, _hold_err = get_finmind_holding_shares_per(
+                                    symbol.strip(), finmind_api_key,
+                                    start_date=f"{_h_year}-01-01"
+                                )
+                            if _hold_err:
+                                st.error(f"❌ {_hold_err}")
+                                st.info("請確認 FinMind API Key 為 Backer 付費等級")
+                            elif _df_hold.empty:
+                                st.warning("⚠️ 無股東持股分級資料")
+                            else:
+                                if "date" in _df_hold.columns:
+                                    _latest_d = _df_hold["date"].max()
+                                    _df_latest = _df_hold[_df_hold["date"] == _latest_d].copy()
+                                    st.info(f"最新資料日期：{_latest_d}　共 {len(_df_hold)} 筆歷史記錄")
+                                    _col_map_h = {
+                                        "date": "日期", "stock_id": "股票代號",
+                                        "HoldingSharesLevel": "持股區間",
+                                        "people": "股東人數", "percent": "持股比例(%)",
+                                        "unit": "持股張數"
+                                    }
+                                    _df_latest = _df_latest.rename(
+                                        columns={k: v for k, v in _col_map_h.items() if k in _df_latest.columns})
+                                    st.subheader(f"最新期（{_latest_d}）持股分佈")
+                                    st.dataframe(_df_latest, use_container_width=True, height=400, hide_index=True)
+                                else:
+                                    st.dataframe(_df_hold, use_container_width=True, height=400, hide_index=True)
+                                _h_csv = _df_hold.to_csv(index=False).encode("utf-8-sig")
+                                st.download_button("📥 下載股東持股分級 CSV", _h_csv,
+                                    file_name=f"holding_per_{symbol.strip()}_{datetime.now().strftime('%Y%m%d')}.csv",
+                                    mime="text/csv")
+
+                        with _t03_tab2:
+                            st.caption("資料來源：GoodInfo.tw（爬取）— 個股董監持股頁面")
+                            with st.spinner(f"正在從 GoodInfo 取得 {symbol.strip()} 董監持股..."):
+                                _df_gi, _gi_err = get_tw_insider_holdings(symbol.strip())
+                            if _gi_err:
+                                st.error(f"❌ {_gi_err}")
+                                st.markdown(f"🔗 [手動查詢 GoodInfo 董監持股](https://goodinfo.tw/tw/StockDirectorSharehold.asp?STOCK_ID={symbol.strip()})")
+                            elif _df_gi.empty:
+                                st.warning("⚠️ GoodInfo 無董監持股資料（可能為動態頁面無法爬取）")
+                                st.markdown(f"🔗 [直接開啟 GoodInfo](https://goodinfo.tw/tw/StockDirectorSharehold.asp?STOCK_ID={symbol.strip()})")
+                            else:
+                                st.dataframe(_df_gi, use_container_width=True, height=400, hide_index=True)
+                                _gi_csv = _df_gi.to_csv(index=False).encode("utf-8-sig")
+                                st.download_button("📥 下載 GoodInfo 董監持股 CSV", _gi_csv,
+                                    file_name=f"goodinfo_director_{symbol.strip()}_{datetime.now().strftime('%Y%m%d')}.csv",
+                                    mime="text/csv")
+
+                        with _t03_tab3:
+                            st.subheader("📚 台股董監事持股申報說明")
+                            st.markdown("""
+### 🏛️ 台灣內部人申報制度
+台灣上市公司董事、監察人及持股超過 **10%** 的大股東，
+依《證券交易法》第22條之2及相關規定，須於持股變動後申報。
+
+### 📋 常見申報類型""")
+                            _tw_type_data = [{"申報類型": t, "參考價值": v["價值"], "說明": v["說明"]}
+                                             for t, v in TW_TRANSACTION_TYPES.items()]
+                            st.dataframe(pd.DataFrame(_tw_type_data), use_container_width=True, hide_index=True)
+                            st.markdown("""
+### ⚠️ 特別注意：股份質押
+- 董監事**設定質押**比例過高，可能代表財務壓力
+- 若遭**強制平倉**，可能對股價造成短期衝擊
+
+### 💡 分析建議
+1. **持股比例高且持續增加**：通常代表董監事對公司前景看好
+2. **買進筆數 >> 賣出筆數**：籌碼集中信號
+3. **質押比例**：留意財務風險
+""")
+                            _tw_csv = pd.DataFrame(_tw_type_data).to_csv(index=False).encode("utf-8-sig")
+                            st.download_button("📥 下載台股申報類型說明 CSV", _tw_csv,
+                                file_name="tw_transaction_types.csv", mime="text/csv")
+
                     elif insider_df is not None and len(insider_df) > 0:
+                        # ── 美股內部人：T03 深度分析 UI ──────────────────
+                        st.markdown("### 👤 內部人買賣分析（SEC Form 4）")
+
+                        # 快速統計卡
+                        _ins_buy  = insider_df[insider_df.get('transactionType', insider_df.columns[0]).str.contains('P-Purchase|Buy', na=False)] if 'transactionType' in insider_df.columns else pd.DataFrame()
+                        _i_c1, _i_c2, _i_c3, _i_c4 = st.columns(4)
+                        with _i_c1: st.metric("申報筆數", f"{len(insider_df)} 筆")
+                        with _i_c2: st.metric("涉及內部人", f"{insider_df['reportingName'].nunique() if 'reportingName' in insider_df.columns else '—'} 人")
+                        with _i_c3: st.metric("買入相關", f"{len(insider_df[insider_df.get('transactionType', pd.Series()).str.contains('P', na=False)]) if 'transactionType' in insider_df.columns else '—'} 筆")
+                        with _i_c4: st.metric("賣出相關", f"{len(insider_df[insider_df.get('transactionType', pd.Series()).str.contains('S-Sale', na=False)]) if 'transactionType' in insider_df.columns else '—'} 筆")
+
+                        # 橫條圖
                         insider_fig = create_insider_chart(insider_df, symbol.upper())
                         if insider_fig:
-                            st.markdown("### 👤 內部人買賣紀錄（近3個月）")
                             st.plotly_chart(insider_fig, use_container_width=True)
+
+                        # 完整明細表（T03 格式）
+                        with st.expander("📋 完整交易明細（含 SEC 連結）", expanded=False):
+                            _ins_proc = process_insider_data(insider_df.to_dict('records') if not insider_df.empty else [])
+                            if not _ins_proc.empty:
+                                _ins_disp = create_transaction_table(_ins_proc)
+                                st.dataframe(
+                                    _ins_disp,
+                                    column_config={
+                                        '交易日期': st.column_config.DateColumn('交易日期', format='YYYY-MM-DD'),
+                                        '內部人代碼': st.column_config.TextColumn('內部人代碼', help='複製此代碼可在 T03 系統查詢跨公司交易'),
+                                        'SEC_URL': st.column_config.LinkColumn('SEC FORM 4', display_text='🔗 查看'),
+                                    },
+                                    use_container_width=True, height=400, hide_index=True
+                                )
+                                _ins_csv = _ins_disp.to_csv(index=False).encode('utf-8-sig')
+                                st.download_button("📥 下載交易明細 CSV", _ins_csv,
+                                    file_name=f"insider_{symbol.upper()}_{datetime.now().strftime('%Y%m%d')}.csv",
+                                    mime="text/csv")
+
+                        # 交易類型說明（T03 整合）
+                        with st.expander("📚 SEC Form 4 交易類型說明", expanded=False):
+                            _tc_data = [{'代碼': k, '中文名稱': v['中文'], '參考價值': v['價值'],
+                                         '交易類別': v['類別'], '說明': v['說明']}
+                                        for k, v in TRANSACTION_CODES.items()]
+                            st.dataframe(pd.DataFrame(_tc_data), use_container_width=True, hide_index=True)
+                            st.markdown("""
+**💡 計劃性變現 vs 主動交易辨別：**
+- **計劃性**：±2天內同時出現 M-Exempt + F-InKind + S-Sale（薪酬計劃正常流程）
+- **主動交易**：單純 P-Purchase 或 S-Sale，無 M/F 組合
+建議至 SEC FORM 4 連結確認實際申報內容。
+""")
 
                     # ── 顯示 9：法人目標價（AI 搜尋新聞彙整）──
                     st.markdown("### 🎯 法人目標價分析（近一個月新聞彙整）")
@@ -3643,7 +4128,9 @@ if not analyze_button:
 - **🚦 多頭訊號儀表板**: 8項指標燈號（🟢🟡🔴）+ 整體評分（0–100分）
 - **台股特有**: 三大法人中文表格+10日加總、季度財務長條圖（5年20季度+股價）
 - **估值分析**: P/E等6張獨立趨勢圖（PE/PEG/PS/PBR/殖利率/年均股價），共享時間軸
-- **內部人分析**: 美股橫條圖 + 台股GoodInfo連結；法人目標價 + 鉅亨網連結
+- **內部人分析（T03 強化）**:
+  - 美股：SEC Form 4 橫條圖 + 完整明細表 + SEC連結 + 20種交易類型說明
+  - 台股：MoneyDJ + MOPS 雙來源 + 股東持股分級（FinMind Backer）+ GoodInfo 董監持股
 - **AI智能分析**: gpt-4o-mini 深度分析，結論含股價位階、多頭訊號強弱、中長線勝率
 
 ### 📝 使用方法
@@ -3671,6 +4158,8 @@ MACD轉正 / BB突破中軌 / BB壓縮突破 / OBV資金流入 / RSI動量 / DMI
 - **三大法人**: 外資/投信/自營商每日買賣超，中文欄位+10日加總
 - **融資/融券餘額**: 市場槓桿水位與空方籌碼
 - **季度財務長條圖**: EPS/營收/毛利/營業利益，5年20季度含股價趨勢線
+- **股東持股分級**: FinMind Backer 籌碼集中度（T03 功能）
+- **GoodInfo 董監持股**: 個股董監持股明細爬取（T03 功能）
 
 ### 🔑 API 金鑰獲取
 - **FMP API（美股）**: [Financial Modeling Prep](https://financialmodelingprep.com/developer/docs)
@@ -3680,3 +4169,25 @@ MACD轉正 / BB突破中軌 / BB壓縮突破 / OBV資金流入 / RSI動量 / DMI
 ---
 **開始您的技術分析之旅吧！** 📈
 """)
+
+# ── T03 全市場董監持股排行（首頁常設工具）──────────────────────────────
+with st.expander("🏆 全市場董監持股排行（GoodInfo，點擊展開）", expanded=False):
+    st.caption("資料來源：GoodInfo.tw — 全體上市公司董監持股比例排行（前300名）")
+    if st.button("🔄 載入排行資料", key="load_ranking"):
+        with st.spinner("正在從 GoodInfo 取得全市場董監持股排行..."):
+            _df_rank, _rank_err = get_tw_insider_ranking(rank_range=300)
+        if _rank_err:
+            st.error(f"❌ {_rank_err}")
+            st.markdown("🔗 [手動查詢 GoodInfo 排行](https://goodinfo.tw/tw/StockList.asp?MARKET_CAT=熱門排行&INDUSTRY_CAT=全體董監持股比例)")
+        elif _df_rank.empty:
+            st.warning("⚠️ 無法取得排行資料")
+        else:
+            st.success(f"成功取得 {len(_df_rank)} 筆排行資料")
+            st.dataframe(_df_rank, use_container_width=True, height=500, hide_index=True)
+            _rank_csv = _df_rank.to_csv(index=False).encode("utf-8-sig")
+            st.download_button("📥 下載排行 CSV", _rank_csv,
+                file_name=f"insider_ranking_{datetime.now().strftime('%Y%m%d')}.csv",
+                mime="text/csv")
+    else:
+        st.info("點擊上方按鈕載入全市場排行資料（需稍等約 3~5 秒）")
+
