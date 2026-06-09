@@ -1043,191 +1043,36 @@ def get_tw_director_sharehold(symbol, api_key=None):
     """
     台股內部人持股異動 — 雙來源策略
     ────────────────────────────────
-    主來源：MoneyDJ 董監質設異動清單（近3個月，HTML 爬取）
+    主來源：GoodInfo 個股董監持股頁（HTML 爬取）
     備用來源：MOPS 公開資訊觀測站（當年度 + 上年度，POST API）
-
-    防爬蟲措施（MoneyDJ）：
-    - 隨機 User-Agent 輪換（6 組）
-    - 隨機請求延遲 1.0~2.5 秒
-    - Session 複用 + Cookie 暖身
-    - Referer / DNT / Accept-Encoding 擬真標頭
-    - WAF / Cloudflare 偵測後自動降級至 MOPS
 
     回傳 dict：
       {
-        "moneydj": DataFrame | None,   # 近3個月申報（MoneyDJ）
-        "mops":    DataFrame | None,   # 年度申報（MOPS，當年+上年）
-        "source":  "moneydj" | "mops" | "both" | "none",
+        "goodinfo": DataFrame | None,  # GoodInfo 董監持股明細
+        "mops":     DataFrame | None,  # MOPS 年度申報（當年+上年）
+        "source":   "goodinfo" | "mops" | "both" | "none",
       }
-    以 director_df["moneydj"] / director_df["mops"] 分別取用。
     """
-    _USER_AGENTS = [
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/123.0.0.0 Safari/537.36 Edg/123.0.0.0",
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-        "Mozilla/5.0 (Windows NT 10.0; Win64; x64; rv:125.0) Gecko/20100101 Firefox/125.0",
-        "Mozilla/5.0 (Macintosh; Intel Mac OS X 14_4_1) AppleWebKit/605.1.15 (KHTML, like Gecko) Version/17.4.1 Safari/605.1.15",
-        "Mozilla/5.0 (X11; Linux x86_64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
-    ]
+    # ── 主來源：GoodInfo ──────────────────────────────────────
+    goodinfo_df, _gi_err = get_tw_insider_holdings(symbol)
+    if goodinfo_df is not None and goodinfo_df.empty:
+        goodinfo_df = None
 
-    def _rh(referer="https://www.moneydj.com/"):
-        return {
-            "User-Agent":      random.choice(_USER_AGENTS),
-            "Accept":          "text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8",
-            "Accept-Language": "zh-TW,zh;q=0.9,en-US;q=0.7,en;q=0.5",
-            "Accept-Encoding": "gzip, deflate, br",
-            "DNT":             "1",
-            "Connection":      "keep-alive",
-            "Upgrade-Insecure-Requests": "1",
-            "Referer":         referer,
-            "Cache-Control":   "max-age=0",
-        }
-
-    def _jitter(lo=1.0, hi=2.5):
-        time.sleep(random.uniform(lo, hi))
-
-    def _decode(raw):
-        for enc in ("big5", "cp950", "utf-8"):
-            try:
-                return raw.decode(enc, errors="replace")
-            except Exception:
-                pass
-        return raw.decode("utf-8", errors="replace")
-
-    def _fetch_moneydj():
-        """爬取 MoneyDJ 個股董監頁，回傳 DataFrame | None"""
-        if not _BS4_OK:
-            return None
-        try:
-            session = requests.Session()
-            session.max_redirects = 5
-            try:
-                session.get("https://www.moneydj.com/",
-                            headers=_rh("https://www.google.com/"), timeout=10)
-                _jitter(0.8, 1.8)
-            except Exception:
-                pass
-
-            url = f"https://www.moneydj.com/z/zc/zck/zck_{symbol}.djhtm"
-            resp = session.get(url, headers=_rh(), timeout=20)
-            resp.raise_for_status()
-            _jitter(0.5, 1.2)
-
-            html = _decode(resp.content)
-            if len(html) < 800:
-                return None
-            if any(kw in html for kw in ["Cloudflare", "Just a moment",
-                                          "Enable JavaScript", "access denied"]):
-                return None
-
-            soup = _BS4(html, "html.parser")
-            target_table, best_n = None, 0
-            for tbl in soup.find_all("table"):
-                txt = tbl.get_text()
-                if any(kw in txt for kw in ["買進", "轉讓", "持股", "職稱", "申報"]):
-                    n = len(tbl.find_all("tr"))
-                    if n > best_n:
-                        best_n, target_table = n, tbl
-
-            if target_table is None or best_n < 3:
-                return None
-
-            rows = target_table.find_all("tr")
-            ci = {k: None for k in ["date","role","name","before","after","buy","sell","pct"]}
-            for i, cell in enumerate(rows[0].find_all(["th","td"])):
-                t = cell.get_text(strip=True)
-                if "申報" in t and "日" in t:           ci["date"]   = i
-                elif "職" in t or "身份" in t:          ci["role"]   = i
-                elif "姓名" in t or "代表" in t:         ci["name"]   = i
-                elif "異動前" in t or "選任" in t:       ci["before"] = i
-                elif "異動後" in t or "目前" in t:       ci["after"]  = i
-                elif "買進" in t:                       ci["buy"]    = i
-                elif "賣出" in t or "轉讓" in t:        ci["sell"]   = i
-                elif "%" in t and "持股" in t:          ci["pct"]    = i
-
-            def _ci_val(v):
-                try:
-                    return int(str(v).replace(",","").replace("，","")
-                               .replace("-","0").strip() or "0")
-                except Exception:
-                    return 0
-
-            now_yr = datetime.now().year
-            cutoff = datetime.now() - timedelta(days=90)
-            recs = []
-
-            for row in rows[1:]:
-                cells = row.find_all("td")
-                if len(cells) < 3:
-                    continue
-                def _g(idx):
-                    return cells[idx].get_text(strip=True) if idx is not None and idx < len(cells) else ""
-
-                raw_d = _g(ci["date"]) if ci["date"] is not None else cells[0].get_text(strip=True)
-                dt = None
-                for fmt, s in [("%Y/%m/%d", raw_d), ("%Y/%m/%d", f"{now_yr}/{raw_d}")]:
-                    try:
-                        dt = datetime.strptime(s, fmt); break
-                    except Exception:
-                        pass
-                if not dt or dt < cutoff:
-                    continue
-
-                buy_sh  = _ci_val(_g(ci["buy"]))    if ci["buy"]    is not None else 0
-                sell_sh = _ci_val(_g(ci["sell"]))   if ci["sell"]   is not None else 0
-                before  = _ci_val(_g(ci["before"])) if ci["before"] is not None else 0
-                after   = _ci_val(_g(ci["after"]))  if ci["after"]  is not None else 0
-                pct_str = _g(ci["pct"])             if ci["pct"]    is not None else ""
-
-                if buy_sh > 0 or sell_sh > 0:
-                    delta = (buy_sh - sell_sh) * 1000
-                elif before > 0 or after > 0:
-                    delta = (after - before) * 1000
-                else:
-                    continue
-                if delta == 0:
-                    continue
-
-                recs.append({
-                    "申報日期":    raw_d,
-                    "職稱":       _g(ci["role"]),
-                    "姓名":       _g(ci["name"]),
-                    "異動前持股數": before * 1000,
-                    "異動後持股數": after  * 1000,
-                    "買進(千股)":  buy_sh,
-                    "賣出(千股)":  sell_sh,
-                    "異動股數":    delta,
-                    "持股%":      pct_str,
-                    "買賣":       "🔴買入" if delta > 0 else "🟢賣出",
-                    "date":       dt,
-                })
-
-            if not recs:
-                return None
-            return (pd.DataFrame(recs)
-                    .sort_values("date", ascending=False)
-                    .reset_index(drop=True))
-
-        except Exception:
-            return None
-
-    # ── 雙來源並行取得 ──────────────────────────────────────────
-    moneydj_df = _fetch_moneydj()
-
+    # ── 備用來源：MOPS ────────────────────────────────────────
     mops_df, _ = get_mops_insider_changes(symbol)
     if isinstance(mops_df, pd.DataFrame) and mops_df.empty:
         mops_df = None
 
-    if moneydj_df is not None and mops_df is not None:
+    if goodinfo_df is not None and mops_df is not None:
         source = "both"
-    elif moneydj_df is not None:
-        source = "moneydj"
+    elif goodinfo_df is not None:
+        source = "goodinfo"
     elif mops_df is not None:
         source = "mops"
     else:
         source = "none"
 
-    return {"moneydj": moneydj_df, "mops": mops_df, "source": source}
+    return {"goodinfo": goodinfo_df, "mops": mops_df, "source": source}
 
 
 
@@ -2942,8 +2787,8 @@ def generate_ai_insights(symbol, stock_data, openai_api_key, start_date, end_dat
                 user_prompt += f"\n### 三大法人買賣超（最新資料）\n{inst_json}\n"
             if director_df is not None and isinstance(director_df, dict):
                 try:
-                    # 優先用 MoneyDJ（近3月），其次用 MOPS
-                    _dir_src = director_df.get("moneydj") or director_df.get("mops")
+                    # 優先用 GoodInfo，其次用 MOPS
+                    _dir_src = director_df.get("goodinfo") or director_df.get("mops")
                     if _dir_src is not None and len(_dir_src) > 0:
                         dir_json = _dir_src.head(20).to_json(orient='records', date_format='iso')
                         user_prompt += f"\n### 近3個月董監持股異動明細（最新20筆）\n{dir_json}\n"
@@ -3277,11 +3122,11 @@ if analyze_button:
                     with st.spinner("正在獲取財務報表數據（5年）..."):
                         financial_data = get_tw_financial_statements(symbol.strip(), finmind_api_key)
 
-                    with st.spinner("正在從 MoneyDJ + MOPS 獲取台股董監持股異動（含防爬蟲延遲）..."):
+                    with st.spinner("正在從 GoodInfo + MOPS 獲取台股董監持股異動..."):
                         _director_result = get_tw_director_sharehold(symbol.strip(), finmind_api_key)
-                        # _director_result 為 dict：{"moneydj": df|None, "mops": df|None, "source": str}
+                        # _director_result 為 dict：{"goodinfo": df|None, "mops": df|None, "source": str}
                         director_df       = _director_result   # 傳遞 dict 給後續顯示邏輯
-                        _dj_df  = _director_result.get("moneydj")
+                        _dj_df  = _director_result.get("goodinfo")
                         _mp_df  = _director_result.get("mops")
                         _src    = _director_result.get("source", "none")
 
@@ -3296,9 +3141,9 @@ if analyze_button:
                         _dj_n  = len(_dj_df) if _dj_df is not None else 0
                         _mp_n  = len(_mp_df) if _mp_df is not None else 0
                         if _src == "both":
-                            status_parts.append(f"董監持股異動 MoneyDJ({_dj_n}筆)+MOPS({_mp_n}筆)")
-                        elif _src == "moneydj":
-                            status_parts.append(f"董監持股異動-MoneyDJ({_dj_n}筆)")
+                            status_parts.append(f"董監持股異動 GoodInfo({_dj_n}筆)+MOPS({_mp_n}筆)")
+                        elif _src == "goodinfo":
+                            status_parts.append(f"董監持股異動-GoodInfo({_dj_n}筆)")
                         elif _src == "mops":
                             status_parts.append(f"董監持股異動-MOPS({_mp_n}筆)")
                     if financial_data and financial_data.get('quarterly') is not None:
@@ -3672,18 +3517,18 @@ if analyze_button:
 
 
                     if is_tw:
-                        st.markdown("### 🔍 內部人買賣分析（MoneyDJ + MOPS 雙來源）")
+                        st.markdown("### 🔍 內部人買賣分析（GoodInfo + MOPS 雙來源）")
 
-                        _dj   = director_df.get("moneydj") if isinstance(director_df, dict) else None
+                        _dj   = director_df.get("goodinfo") if isinstance(director_df, dict) else None
                         _mp   = director_df.get("mops")    if isinstance(director_df, dict) else None
                         _srck = director_df.get("source", "none") if isinstance(director_df, dict) else "none"
 
                         # ── 來源狀態徽章 ──────────────────────────────
                         _src_badge = {
-                            "both":     "✅ MoneyDJ（近3月）＋ MOPS（年度申報）雙來源",
-                            "moneydj":  "✅ MoneyDJ（近3月）｜ ⚠️ MOPS 暫無資料",
-                            "mops":     "⚠️ MoneyDJ 無法取得（防爬機制）｜ ✅ MOPS（年度申報）",
-                            "none":     "❌ MoneyDJ 與 MOPS 均無法取得資料",
+                            "both":     "✅ GoodInfo（董監持股）＋ MOPS（年度申報）雙來源",
+                            "goodinfo": "✅ GoodInfo（董監持股）｜ ⚠️ MOPS 暫無資料",
+                            "mops":     "⚠️ GoodInfo 無法取得｜ ✅ MOPS（年度申報）",
+                            "none":     "❌ GoodInfo 與 MOPS 均無法取得資料",
                         }.get(_srck, "—")
                         st.caption(f"📡 資料來源狀態：{_src_badge}")
 
@@ -3708,24 +3553,24 @@ if analyze_button:
                                     st.metric("淨異動（股）", f"{_net_t:,.0f}",
                                               delta="淨買超 ▲" if _net_t > 0 else "淨賣超 ▼")
                                 with dc4:
-                                    _src_label = "MoneyDJ 近3月" if _dj is not None else "MOPS 年度"
+                                    _src_label = "GoodInfo 董監" if _dj is not None else "MOPS 年度"
                                     st.metric("申報筆數", f"{len(_any_df)} 筆", delta=_src_label)
 
                         # ── 頁籤：有資料才顯示，無資料顯示明確提示 ──
                         _has_data = (_dj is not None) or (_mp is not None)
                         if _has_data:
                             _tab_labels = []
-                            if _dj is not None: _tab_labels.append("📅 MoneyDJ 近3月申報")
+                            if _dj is not None: _tab_labels.append("📊 GoodInfo 董監持股")
                             if _mp is not None: _tab_labels.append("🏛️ MOPS 年度申報")
                             _tab_labels.append("📊 買賣走勢圖")
 
                             _tabs = st.tabs(_tab_labels)
                             _tab_idx = 0
 
-                            # ── 頁籤 A：MoneyDJ ──────────────────────
+                            # ── 頁籤 A：GoodInfo ────────────────────
                             if _dj is not None:
                                 with _tabs[_tab_idx]:
-                                    st.caption("資料來源：MoneyDJ 董監質設異動清單（近90天申報）")
+                                    st.caption("資料來源：GoodInfo.tw 個股董監持股頁面")
                                     _dj_disp_cols = [c for c in [
                                         "申報日期","職稱","姓名",
                                         "買進(千股)","賣出(千股)",
@@ -3818,27 +3663,21 @@ if analyze_button:
                         else:
                             # 雙來源皆失敗 — 給出明確原因和手動查詢方式
                             st.warning(
-                                "⚠️ **MoneyDJ 與 MOPS 均無法自動取得資料**\n\n"
+                                "⚠️ **GoodInfo 與 MOPS 均無法自動取得資料**\n\n"
                                 "**可能原因：**\n"
-                                "- MoneyDJ：防爬蟲機制（403）或近3個月無申報\n"
+                                "- GoodInfo：頁面為動態載入或網路逾時\n"
                                 "- MOPS：網路逾時 或 該股今年度尚無申報記錄\n\n"
                                 "**請點擊下方連結手動查詢 ↓**"
                             )
-                            _mc1, _mc2, _mc3 = st.columns(3)
+                            _mc1, _mc2 = st.columns(2)
                             with _mc1:
-                                st.markdown(f"🔗 [MoneyDJ 董監申報]"
-                                            f"(https://www.moneydj.com/z/zc/zck/zck_{symbol.strip()}.djhtm)")
+                                st.markdown(f"🔗 [GoodInfo 董監持股](https://goodinfo.tw/tw/StockDirectorSharehold.asp?STOCK_ID={symbol.strip()})")
                             with _mc2:
-                                st.markdown(f"🔗 [MOPS 公開資訊觀測站]"
-                                            f"(https://mops.twse.com.tw/mops/web/t51sb06)")
-                            with _mc3:
-                                st.markdown(f"🔗 [GoodInfo 董監持股]"
-                                            f"(https://goodinfo.tw/tw/StockDirectorSharehold.asp?STOCK_ID={symbol.strip()})")
+                                st.markdown(f"🔗 [MOPS 公開資訊觀測站](https://mops.twse.com.tw/mops/web/t51sb06)")
 
                         # ── 補充查詢連結（有資料時才顯示，避免與無資料提示重複）──
                         if _has_data:
                             st.markdown(f"""
-🔗 [MoneyDJ 董監持股明細](https://www.moneydj.com/z/zc/zck/zck_{symbol.strip()}.djhtm) ｜
 🔗 [GoodInfo 董監持股查詢](https://goodinfo.tw/tw/StockDirectorSharehold.asp?STOCK_ID={symbol.strip()}) ｜
 🔗 [MOPS 公開資訊觀測站](https://mops.twse.com.tw/mops/web/t51sb06)
 """)
@@ -4130,7 +3969,7 @@ if not analyze_button:
 - **估值分析**: P/E等6張獨立趨勢圖（PE/PEG/PS/PBR/殖利率/年均股價），共享時間軸
 - **內部人分析（T03 強化）**:
   - 美股：SEC Form 4 橫條圖 + 完整明細表 + SEC連結 + 20種交易類型說明
-  - 台股：MoneyDJ + MOPS 雙來源 + 股東持股分級（FinMind Backer）+ GoodInfo 董監持股
+  - 台股：GoodInfo + MOPS 雙來源 + 股東持股分級（FinMind Backer）+ GoodInfo 董監持股
 - **AI智能分析**: gpt-4o-mini 深度分析，結論含股價位階、多頭訊號強弱、中長線勝率
 
 ### 📝 使用方法
