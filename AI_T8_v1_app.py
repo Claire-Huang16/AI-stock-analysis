@@ -308,9 +308,8 @@ def _goodinfo_get(url, params=None, timeout=20):
 
 def _parse_txtStockListData(html):
     """解析 goodinfo StockList 頁面中 #txtStockListData 的表格"""
-    if not _BS4_OK:
-        return pd.DataFrame()
-    soup = _BS4(html, "html.parser")
+    from bs4 import BeautifulSoup
+    soup = BeautifulSoup(html, "html.parser")
     div = soup.find("div", id="txtStockListData")
     if not div:
         return pd.DataFrame()
@@ -331,9 +330,8 @@ def _parse_txtStockListData(html):
 
 def _parse_director_table(html):
     """解析 goodinfo 個股董監持股頁面（StockDirectorSharehold）"""
-    if not _BS4_OK:
-        return pd.DataFrame()
-    soup = _BS4(html, "html.parser")
+    from bs4 import BeautifulSoup
+    soup = BeautifulSoup(html, "html.parser")
     container = (soup.find("div", id="divDetail") or
                  soup.find("table", id="tblDetail") or
                  soup.find("div", id="divStockDetail"))
@@ -362,8 +360,6 @@ def _parse_director_table(html):
 @st.cache_data(ttl=1800)
 def get_tw_insider_holdings(stock_code):
     """goodinfo 個股董監持股明細，回傳 (DataFrame, error)"""
-    if not _BS4_OK:
-        return pd.DataFrame(), "缺少 beautifulsoup4（請在 requirements.txt 加入）"
     html, err = _goodinfo_get(
         "https://goodinfo.tw/tw/StockDirectorSharehold.asp",
         params={"STOCK_ID": stock_code}
@@ -857,32 +853,6 @@ def get_tw_financial_statements(symbol, api_key):
     return result
 
 
-def get_tw_pe_ps_history(symbol, api_key):
-    try:
-        url = "https://api.finmindtrade.com/api/v4/data"
-        params = {
-            'dataset': 'TaiwanStockPER',
-            'data_id': symbol,
-            'start_date': (datetime.now() - timedelta(days=365 * 5)).strftime('%Y-%m-%d'),
-            'token': api_key
-        }
-        resp = requests.get(url, params=params, timeout=20)
-        resp.raise_for_status()
-        result = resp.json()
-        if result.get('status') != 200 or not result.get('data'):
-            return None
-        df = pd.DataFrame(result['data'])
-        if 'date' not in df.columns:
-            return None
-        df['date'] = pd.to_datetime(df['date'])
-        for col in ['PER', 'PBR', 'dividend_yield']:
-            if col in df.columns:
-                df[col] = pd.to_numeric(df[col], errors='coerce')
-        df = df.sort_values('date').reset_index(drop=True)
-        return {'ratios': df}
-    except Exception:
-        return None
-
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -1144,29 +1114,212 @@ def get_analyst_targets(symbol, api_key):
     return result if (result['targets'] is not None or result['consensus'] is not None) else None
 
 
+# ─────────────────────────────────────────────
+# 法人目標價 — 額外爬蟲來源
+# ─────────────────────────────────────────────
+
+def get_finviz_targets(symbol):
+    """
+    美股 Finviz 法人目標價與評等爬蟲（無需 API Key，免費公開頁面）。
+    URL: https://finviz.com/quote.ashx?t={symbol}
+    回傳 (DataFrame, error_msg)
+    DataFrame 欄位：券商／機構名稱 | 評等 | 評等異動 | 目標價 | 更新日期
+    """
+    if not _BS4_OK:
+        return pd.DataFrame(), "bs4 未安裝，無法爬取 Finviz"
+    url = f"https://finviz.com/quote.ashx?t={symbol.upper()}"
+    headers = {
+        "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                       "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"),
+        "Accept-Language": "en-US,en;q=0.9",
+        "Referer": "https://finviz.com/",
+    }
+    try:
+        time.sleep(random.uniform(0.5, 1.2))
+        resp = requests.get(url, headers=headers, timeout=20)
+        if resp.status_code != 200:
+            return pd.DataFrame(), f"Finviz HTTP {resp.status_code}"
+        soup = _BS4(resp.text, "html.parser")
+        # 找 id="news-table" 上方的 analyst ratings 表格（class 含 ratings-outer-table 或 fullview-ratings-outer）
+        table = soup.find("table", class_="js-table-ratings") or                 soup.find("table", {"id": "ratings_outer_table"}) or                 soup.find("table", class_="fullview-ratings-outer")
+        if table is None:
+            # 備用：找包含多個 Rating 欄位的表格
+            for t in soup.find_all("table"):
+                text = t.get_text()
+                if "Price Target" in text and "Action" in text:
+                    table = t
+                    break
+        if table is None:
+            return pd.DataFrame(), "Finviz：找不到目標價表格（頁面結構可能已變更）"
+
+        rows = table.find_all("tr")
+        records = []
+        for row in rows:
+            cols = [td.get_text(strip=True) for td in row.find_all("td")]
+            if len(cols) >= 4:
+                records.append(cols[:5] if len(cols) >= 5 else cols + [''] * (5 - len(cols)))
+
+        if not records:
+            return pd.DataFrame(), "Finviz：解析結果為空"
+
+        df = pd.DataFrame(records)
+        # Finviz 欄位順序通常是：Date | Broker | Action | Rating | Target
+        if df.shape[1] >= 5:
+            df.columns = ['更新日期', '券商／機構名稱', '評等異動', '評等', '目標價'] +                          [f'col{i}' for i in range(5, df.shape[1])]
+            df = df[['券商／機構名稱', '評等', '評等異動', '目標價', '更新日期']]
+        elif df.shape[1] == 4:
+            df.columns = ['更新日期', '券商／機構名稱', '評等', '目標價']
+            df['評等異動'] = '—'
+            df = df[['券商／機構名稱', '評等', '評等異動', '目標價', '更新日期']]
+        else:
+            return pd.DataFrame(), f"Finviz：欄位數不符（{df.shape[1]}欄）"
+
+        df = df[df['券商／機構名稱'].str.strip() != ''].reset_index(drop=True)
+        return df, None
+    except requests.exceptions.Timeout:
+        return pd.DataFrame(), "Finviz 請求逾時"
+    except requests.exceptions.ConnectionError:
+        return pd.DataFrame(), "無法連線至 finviz.com"
+    except Exception as e:
+        return pd.DataFrame(), str(e)
+
+
+def get_anue_targets(symbol, stock_name=None):
+    """
+    台股鉅亨網法人評等爬蟲。
+    搜尋 URL: https://news.cnyes.com/news/cat/tw_stock_target_price?keyword={keyword}
+    回傳 (DataFrame, error_msg)
+    DataFrame 欄位：券商／機構名稱 | 目標價 | 評等 | 更新日期 | 來源摘要
+    """
+    if not _BS4_OK:
+        return pd.DataFrame(), "bs4 未安裝，無法爬取鉅亨網"
+    keyword = f"{symbol} {stock_name}".strip() if stock_name else symbol
+    headers = {
+        "User-Agent": ("Mozilla/5.0 (Windows NT 10.0; Win64; x64) "
+                       "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0 Safari/537.36"),
+        "Accept-Language": "zh-TW,zh;q=0.9",
+        "Referer": "https://news.cnyes.com/",
+    }
+    try:
+        time.sleep(random.uniform(0.8, 1.5))
+        # 鉅亨網新聞搜尋 API
+        api_url = "https://api.cnyes.com/media/api/v1/newslist/category/tw_stock_target_price"
+        params = {"limit": 30, "page": 1, "keyword": keyword}
+        resp = requests.get(api_url, headers=headers, params=params, timeout=20)
+        if resp.status_code != 200:
+            # 備用：一般新聞搜尋
+            api_url2 = f"https://api.cnyes.com/media/api/v1/newslist/search?keyword={keyword}&limit=20"
+            resp = requests.get(api_url2, headers=headers, timeout=20)
+            if resp.status_code != 200:
+                return pd.DataFrame(), f"鉅亨網 HTTP {resp.status_code}"
+        data = resp.json()
+        items = (data.get("data", {}).get("items") or
+                 data.get("items") or
+                 data.get("data") or [])
+        if not items or not isinstance(items, list):
+            return pd.DataFrame(), "鉅亨網：無搜尋結果"
+
+        records = []
+        for item in items[:20]:
+            title    = item.get("title", "")
+            summary  = item.get("summary", item.get("content", ""))[:60]
+            pub_at   = item.get("publishAt") or item.get("publish_at") or ""
+            if pub_at:
+                try:
+                    pub_at = datetime.fromtimestamp(int(pub_at)).strftime("%Y-%m-%d")
+                except Exception:
+                    pub_at = str(pub_at)[:10]
+            # 從標題擷取目標價（正則）
+            import re
+            price_match = re.search(r'目標(?:價|價位)[：:]\s*([NT$]*[\d,\.]+)', title)
+            target_price = price_match.group(1) if price_match else "—"
+            # 擷取評等
+            rating_map = {"買進": "買進", "買入": "買進", "強烈買進": "強烈買進",
+                          "中立": "中立", "持有": "持有", "賣出": "賣出", "減碼": "減碼",
+                          "增加持股": "增持", "優於大盤": "優於大盤", "Outperform": "優於大盤"}
+            rating = "—"
+            for k, v in rating_map.items():
+                if k in title:
+                    rating = v
+                    break
+            # 擷取機構名稱（常見格式：「XXX證券」「XX投信」）
+            inst_match = re.search(r'([^\s，,、]{2,6}(?:證券|投行|投信|投顧|銀行|Capital|Securities|Research))', title)
+            institution = inst_match.group(1) if inst_match else "鉅亨網"
+            records.append({
+                '券商／機構名稱': institution,
+                '目標價': target_price,
+                '評等': rating,
+                '更新日期': pub_at,
+                '來源摘要': title[:40],
+            })
+
+        if not records:
+            return pd.DataFrame(), "鉅亨網：無法解析目標價資料"
+        df = pd.DataFrame(records)
+        return df, None
+    except requests.exceptions.Timeout:
+        return pd.DataFrame(), "鉅亨網請求逾時"
+    except requests.exceptions.ConnectionError:
+        return pd.DataFrame(), "無法連線至鉅亨網"
+    except Exception as e:
+        return pd.DataFrame(), str(e)
+
+
+def get_goodinfo_stock_rating(symbol):
+    """
+    GoodInfo 個股法人評等（StockRating.asp）爬蟲。
+    回傳 (DataFrame, error_msg)
+    DataFrame 欄位：券商／機構名稱 | 評等 | 目標價 | 更新日期
+    """
+    if not _BS4_OK:
+        return pd.DataFrame(), "bs4 未安裝，無法爬取 GoodInfo"
+    html, err = _goodinfo_get(
+        "https://goodinfo.tw/tw/StockRating.asp",
+        params={"STOCK_ID": symbol}
+    )
+    if err:
+        return pd.DataFrame(), f"GoodInfo：{err}"
+    try:
+        soup = _BS4(html, "html.parser")
+        # 找含有評等資料的主要表格
+        target_div = (soup.find("div", id="divDetail") or
+                      soup.find("div", id="divRating") or
+                      soup.find("div", id="txtStockListData"))
+        parse_html = target_div.prettify() if target_div else html
+        dfs = pd.read_html(parse_html)
+        dfs = [df for df in dfs if df.shape[0] > 1 and df.shape[1] >= 3]
+        if not dfs:
+            return pd.DataFrame(), "GoodInfo：找不到評等表格"
+        df = dfs[0]
+        if isinstance(df.columns, pd.MultiIndex):
+            df.columns = [" ".join(str(c) for c in col if "Unnamed" not in str(c)).strip()
+                          for col in df.columns]
+        df.columns = [str(c).strip() for c in df.columns]
+        df = df.dropna(how="all").reset_index(drop=True)
+        return df, None
+    except Exception as e:
+        return pd.DataFrame(), f"GoodInfo 評等解析失敗：{str(e)}"
+
+
 def get_analyst_targets_ai(symbol, openai_api_key, market='us', stock_name=None):
     """
-    使用 OpenAI gpt-4o-mini + web_search 搜尋近一個月法人目標價新聞，
-    並彙整為結構化表格（v4.4 規格）
+    使用 OpenAI gpt-4o-mini + web_search_preview 搜尋近一個月法人目標價新聞。
+    使用 Responses API（支援 web_search_preview 工具）。
     返回：dict { 'table': DataFrame or None, 'search_date': str }
     """
-    try:
-        from datetime import datetime
-        import json
+    import json
 
-        today = datetime.now()
-        search_date = today.strftime('%Y-%m-%d')
-        yyyy_mm = today.strftime('%Y年%m月') if market == 'tw' else today.strftime('%Y-%m')
+    today = datetime.now()
+    search_date = today.strftime('%Y-%m-%d')
+    yyyy_mm = today.strftime('%Y年%m月') if market == 'tw' else today.strftime('%Y-%m')
 
-        if market == 'tw':
-            name_part = f"{symbol} {stock_name}" if stock_name else symbol
-            query = f"{name_part} 目標價 法人 {yyyy_mm}"
-        else:
-            query = f"{symbol} price target analyst {yyyy_mm}"
+    if market == 'tw':
+        name_part = f"{symbol} {stock_name}" if stock_name else symbol
+        query = f"{name_part} 目標價 法人 {yyyy_mm}"
+    else:
+        query = f"{symbol} price target analyst {yyyy_mm}"
 
-        client = __import__('openai').OpenAI(api_key=openai_api_key)
-
-        system_msg = """你是一位專業的股票研究助理，負責從網路新聞中彙整法人目標價資訊。
+    system_msg = """你是一位專業的股票研究助理，負責從網路新聞中彙整法人目標價資訊。
 請搜尋近一個月內各大券商、投行對指定股票的目標價報導，並以 JSON 格式回傳結構化資料。
 
 回傳格式（僅回傳純 JSON，不含 markdown）：
@@ -1185,71 +1338,111 @@ def get_analyst_targets_ai(symbol, openai_api_key, market='us', stock_name=None)
 
 若找不到任何目標價資料，targets 請回傳空陣列 []。"""
 
-        user_msg = f"請搜尋並彙整：{query}"
+    try:
+        import openai
+        client = openai.OpenAI(api_key=openai_api_key)
 
-        response = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[
-                {"role": "system", "content": system_msg},
-                {"role": "user", "content": user_msg}
-            ],
-            tools=[{"type": "web_search_preview"}],
-            max_tokens=1500,
-            temperature=0.2
-        )
-
-        # 解析回應
-        content = ""
-        for block in response.choices[0].message.content if isinstance(response.choices[0].message.content, list) else []:
-            if hasattr(block, 'text'):
-                content += block.text
-        if not content:
+        # ── 方法 1：gpt-4o-search-preview（OpenAI 原生網路搜尋模型）──
+        # 此模型內建即時網路搜尋，直接以 chat.completions 呼叫
+        try:
+            response = client.chat.completions.create(
+                model="gpt-4o-search-preview",
+                web_search_options={},
+                messages=[
+                    {"role": "system", "content": system_msg},
+                    {"role": "user",   "content": f"請搜尋近一個月內的新聞，彙整以下查詢的法人目標價資料：{query}"}
+                ],
+                max_tokens=1500,
+            )
             content = response.choices[0].message.content or ""
 
-        # 清理 JSON fences
-        content = content.strip()
-        if content.startswith("```"):
-            content = content.split("```")[-2] if "```" in content else content
-            content = content.replace("json", "", 1).strip()
+        except Exception:
+            # ── 方法 2：Responses API + web_search_preview（相容舊版 SDK）──
+            try:
+                resp2 = client.responses.create(
+                    model="gpt-4o-mini",
+                    tools=[{"type": "web_search_preview"}],
+                    input=[
+                        {"role": "system", "content": system_msg},
+                        {"role": "user",   "content": f"請搜尋並彙整：{query}"}
+                    ],
+                    max_output_tokens=1500,
+                )
+                content = ""
+                for block in resp2.output:
+                    if hasattr(block, 'content'):
+                        for c in block.content:
+                            if hasattr(c, 'text'):
+                                content += c.text
+                    elif hasattr(block, 'text'):
+                        content += block.text
+            except Exception:
+                # ── 方法 3：純 Chat Completions 降級（無即時搜尋）──
+                resp3 = client.chat.completions.create(
+                    model="gpt-4o-mini",
+                    messages=[
+                        {"role": "system", "content": system_msg},
+                        {"role": "user",   "content": (
+                            f"根據你的訓練知識，請彙整 {query} 的近期法人目標價。"
+                            f"若訓練資料截止後無法得知，請在 note 欄位說明，"
+                            f"targets 回傳空陣列。"
+                        )}
+                    ],
+                    max_tokens=1500,
+                    temperature=0.2,
+                )
+                content = resp3.choices[0].message.content or ""
 
-        data = json.loads(content)
+        # ── 解析 JSON ──────────────────────────────────────────
+        content = content.strip()
+
+        # 移除 markdown code fence
+        if "```" in content:
+            parts = content.split("```")
+            for p in parts:
+                p = p.strip().lstrip("json").lstrip("JSON").strip()
+                if p.startswith("{"):
+                    content = p
+                    break
+
+        # 若含前置說明文字，擷取第一個 { ... } 區塊
+        if not content.startswith("{"):
+            import re as _re
+            m = _re.search(r'\{[\s\S]*\}', content)
+            if m:
+                content = m.group(0)
+
+        try:
+            data = json.loads(content)
+        except json.JSONDecodeError:
+            return {'table': None, 'search_date': search_date,
+                    'error': f'JSON 解析失敗，原始回應前200字：{content[:200]}'}
+
         targets = data.get("targets", [])
 
         if not targets:
             return {'table': None, 'search_date': search_date}
 
         df = pd.DataFrame(targets)
-        df.columns = ['券商／機構名稱', '目標價', '評等', '更新日期', '來源摘要']
+        # 統一欄位名稱（不論 AI 回傳英文或中文 key）
+        col_map = {
+            'institution': '券商／機構名稱',
+            'target_price': '目標價',
+            'rating': '評等',
+            'date': '更新日期',
+            'summary': '來源摘要',
+        }
+        df = df.rename(columns={k: v for k, v in col_map.items() if k in df.columns})
+        expected = ['券商／機構名稱', '目標價', '評等', '更新日期', '來源摘要']
+        for col in expected:
+            if col not in df.columns:
+                df[col] = '—'
+        df = df[expected]
         return {'table': df, 'search_date': search_date}
 
-    except Exception:
-        return {'table': None, 'search_date': datetime.now().strftime('%Y-%m-%d')}
+    except Exception as e:
+        return {'table': None, 'search_date': search_date, 'error': str(e)}
 
-
-def get_pe_ps_history(symbol, api_key):
-    """美股 P/E P/S P/B 歷年財務比率（FMP API）"""
-    try:
-        url = "https://financialmodelingprep.com/stable/ratios"
-        params = {'symbol': symbol, 'apikey': api_key, 'period': 'annual', 'limit': 8}
-        resp = requests.get(url, params=params, timeout=20)
-        resp.raise_for_status()
-        data = resp.json()
-        if not data or not isinstance(data, list):
-            return None
-        df = pd.DataFrame(data)
-        keep = [c for c in ['date', 'priceEarningsRatio', 'priceToSalesRatio',
-                             'priceToBookRatio', 'dividendYield'] if c in df.columns]
-        if 'date' not in df.columns:
-            return None
-        df = df[keep].copy()
-        df['date'] = pd.to_datetime(df['date'], errors='coerce')
-        df = df.dropna(subset=['date']).sort_values('date').reset_index(drop=True)
-        for col in keep:
-            if col != 'date':
-                df[col] = pd.to_numeric(df[col], errors='coerce')
-        return {'ratios': df}
-    except Exception:
-        return None
 
 
 # ─────────────────────────────────────────────
@@ -1368,6 +1561,93 @@ def calculate_advanced_indicators(df):
         plus_prev  = df['DMI_PLUS'].shift(1)
         minus_prev = df['DMI_MINUS'].shift(1)
         df['DMI_GOLDEN'] = (plus_prev < minus_prev) & (df['DMI_PLUS'] > df['DMI_MINUS'])
+    except Exception:
+        pass
+
+    # KD 隨機指標（Stochastic %K/%D，9日）
+    try:
+        period_kd = 9
+        low_min  = df['low'].rolling(period_kd).min()
+        high_max = df['high'].rolling(period_kd).max()
+        rsv = 100 * (df['close'] - low_min) / (high_max - low_min).replace(0, np.nan)
+        rsv = rsv.fillna(50)
+        df['KD_K'] = rsv.ewm(com=2, adjust=False).mean()   # %K（3日EMA平滑）
+        df['KD_D'] = df['KD_K'].ewm(com=2, adjust=False).mean()  # %D
+        k_prev = df['KD_K'].shift(1)
+        d_prev = df['KD_D'].shift(1)
+        df['KD_GOLDEN'] = (k_prev < d_prev) & (df['KD_K'] > df['KD_D'])
+        df['KD_DEAD']   = (k_prev > d_prev) & (df['KD_K'] < df['KD_D'])
+    except Exception:
+        pass
+
+    # ATR（平均真實範圍，14日）— 供 BIAS / 波動度使用
+    try:
+        high  = df['high']
+        low   = df['low']
+        prev_close = df['close'].shift(1)
+        tr1 = high - low
+        tr2 = (high - prev_close).abs()
+        tr3 = (low  - prev_close).abs()
+        TR  = pd.concat([tr1, tr2, tr3], axis=1).max(axis=1)
+        df['ATR14'] = TR.ewm(com=13, adjust=False).mean()
+    except Exception:
+        pass
+
+    # CCI（商品通道指標，20日）
+    try:
+        tp = (df['high'] + df['low'] + df['close']) / 3
+        tp_ma  = tp.rolling(20).mean()
+        tp_mad = tp.rolling(20).apply(lambda x: np.mean(np.abs(x - x.mean())), raw=True)
+        df['CCI20'] = (tp - tp_ma) / (0.015 * tp_mad.replace(0, np.nan))
+    except Exception:
+        pass
+
+    # MFI（資金流量指數，14日）
+    try:
+        tp  = (df['high'] + df['low'] + df['close']) / 3
+        rmf = tp * df['volume']
+        pos_mf = rmf.where(tp > tp.shift(1), 0.0)
+        neg_mf = rmf.where(tp < tp.shift(1), 0.0)
+        pos_sum = pos_mf.rolling(14).sum()
+        neg_sum = neg_mf.rolling(14).sum()
+        mfr = pos_sum / neg_sum.replace(0, np.nan)
+        df['MFI14'] = 100 - (100 / (1 + mfr))
+    except Exception:
+        pass
+
+    # Williams %R（14日）
+    try:
+        hw = df['high'].rolling(14).max()
+        lw = df['low'].rolling(14).min()
+        df['WILLR14'] = -100 * (hw - df['close']) / (hw - lw).replace(0, np.nan)
+    except Exception:
+        pass
+
+    # Aroon（25日）
+    try:
+        aw = 25
+        df['AROON_UP']   = df['high'].rolling(aw + 1).apply(
+            lambda x: 100 * x.argmax() / aw, raw=True)
+        df['AROON_DOWN'] = df['low'].rolling(aw + 1).apply(
+            lambda x: 100 * x.argmin() / aw, raw=True)
+        df['AROON_OSC']  = df['AROON_UP'] - df['AROON_DOWN']
+    except Exception:
+        pass
+
+    # BIAS 乖離率（MA20）
+    try:
+        if 'MA20' not in df.columns:
+            df['MA20'] = df['close'].rolling(20).mean()
+        df['BIAS20'] = (df['close'] - df['MA20']) / df['MA20'] * 100
+    except Exception:
+        pass
+
+    # VWAP（累積）
+    try:
+        tp  = (df['high'] + df['low'] + df['close']) / 3
+        cum_vol = df['volume'].cumsum()
+        cum_tpv = (tp * df['volume']).cumsum()
+        df['VWAP'] = cum_tpv / cum_vol.replace(0, np.nan)
     except Exception:
         pass
 
@@ -1567,24 +1847,99 @@ def calculate_bull_signals(df):
     except Exception:
         add('均線多頭排列', 'red', '無法計算')
 
+    # 9. KD 金叉
+    try:
+        if 'KD_K' in df.columns and 'KD_D' in df.columns:
+            kv = df['KD_K'].iloc[-1]
+            dv = df['KD_D'].iloc[-1]
+            golden_kd = df['KD_GOLDEN'].tail(5).any() if 'KD_GOLDEN' in df.columns else False
+            if golden_kd and kv < 80:
+                add('KD 金叉', 'green', f'近5日K線金叉，K={kv:.1f}，D={dv:.1f}')
+            elif kv > dv and kv < 80:
+                add('KD 金叉', 'yellow', f'K({kv:.1f})>D({dv:.1f})，無近期金叉')
+            elif kv >= 80:
+                add('KD 金叉', 'yellow', f'KD高檔({kv:.1f})，超買警示')
+            else:
+                add('KD 金叉', 'red', f'K({kv:.1f})<D({dv:.1f})，偏空')
+        else:
+            add('KD 金叉', 'red', '無法計算')
+    except Exception:
+        add('KD 金叉', 'red', '無法計算')
+
+    # 10. MFI 資金流入
+    try:
+        if 'MFI14' in df.columns:
+            mv = df['MFI14'].iloc[-1]
+            if 50 <= mv <= 80:
+                add('MFI 資金強度', 'green', f'MFI={mv:.1f}，資金健康流入')
+            elif mv > 80:
+                add('MFI 資金強度', 'yellow', f'MFI={mv:.1f}，超買注意')
+            elif 30 <= mv < 50:
+                add('MFI 資金強度', 'yellow', f'MFI={mv:.1f}，資金偏弱')
+            else:
+                add('MFI 資金強度', 'red', f'MFI={mv:.1f}，資金明顯流出')
+        else:
+            add('MFI 資金強度', 'red', '無法計算')
+    except Exception:
+        add('MFI 資金強度', 'red', '無法計算')
+
+    # 11. CCI 趨勢動能
+    try:
+        if 'CCI20' in df.columns:
+            cv    = df['CCI20'].iloc[-1]
+            cv_p  = df['CCI20'].iloc[-2] if len(df) > 1 else cv
+            if cv > 100:
+                add('CCI 動能', 'green', f'CCI={cv:.1f}，強勢突破區間')
+            elif 0 < cv <= 100 and cv > cv_p:
+                add('CCI 動能', 'green', f'CCI={cv:.1f}，由負轉正且上升')
+            elif -100 <= cv <= 0:
+                add('CCI 動能', 'yellow', f'CCI={cv:.1f}，弱勢整理中')
+            else:
+                add('CCI 動能', 'red', f'CCI={cv:.1f}，超賣偏空')
+        else:
+            add('CCI 動能', 'red', '無法計算')
+    except Exception:
+        add('CCI 動能', 'red', '無法計算')
+
+    # 12. BIAS 乖離率
+    try:
+        if 'BIAS20' in df.columns:
+            bv = df['BIAS20'].iloc[-1]
+            if 0 < bv <= 6:
+                add('BIAS 乖離率', 'green', f'BIAS={bv:.2f}%，正乖離適中')
+            elif bv > 6:
+                add('BIAS 乖離率', 'yellow', f'BIAS={bv:.2f}%，正乖離過大，回調風險')
+            elif -3 <= bv <= 0:
+                add('BIAS 乖離率', 'yellow', f'BIAS={bv:.2f}%，輕微負乖離')
+            else:
+                add('BIAS 乖離率', 'red', f'BIAS={bv:.2f}%，負乖離過深')
+        else:
+            add('BIAS 乖離率', 'red', '無法計算')
+    except Exception:
+        add('BIAS 乖離率', 'red', '無法計算')
+
+    n_signals   = len(signals)
     total_score = sum(s['score'] for s in signals)
+    # 歸一化到100分（不論訊號總數）
+    max_score   = n_signals * 12.5
+    total_score_norm = round(total_score / max_score * 100) if max_score > 0 else 0
     green_count = sum(1 for s in signals if s['status'] == 'green')
 
-    if total_score >= 70:
-        conclusion = f"🟢 多頭訊號確認（{green_count}/8項綠燈）—— 技術面偏多，條件符合"
+    if total_score_norm >= 70:
+        conclusion = f"🟢 多頭訊號確認（{green_count}/{n_signals}項綠燈）—— 技術面偏多，條件符合"
         conclusion_level = 'success'
-    elif total_score >= 40:
-        conclusion = f"🟡 訊號混合（{green_count}/8項綠燈）—— 部分多頭條件成立，需審慎觀察"
+    elif total_score_norm >= 40:
+        conclusion = f"🟡 訊號混合（{green_count}/{n_signals}項綠燈）—— 部分多頭條件成立，需審慎觀察"
         conclusion_level = 'warning'
     else:
-        conclusion = f"🔴 條件不符（{green_count}/8項綠燈）—— 多頭訊號不足，技術面偏弱"
+        conclusion = f"🔴 條件不符（{green_count}/{n_signals}項綠燈）—— 多頭訊號不足，技術面偏弱"
         conclusion_level = 'error'
 
     return {
-        'signals': signals,
-        'total_score': total_score,
-        'conclusion': conclusion,
-        'conclusion_level': conclusion_level
+        'signals':           signals,
+        'total_score':       total_score_norm,
+        'conclusion':        conclusion,
+        'conclusion_level':  conclusion_level
     }
 
 
@@ -1593,7 +1948,8 @@ def display_bull_dashboard(bull_signals, symbol):
     emoji_map = {'green': '🟢', 'yellow': '🟡', 'red': '🔴'}
     signals = bull_signals['signals']
 
-    for row_start in [0, 4]:
+    # 動態排版：每排 4 欄，自動換行
+    for row_start in range(0, len(signals), 4):
         cols = st.columns(4)
         for i, col in enumerate(cols):
             idx = row_start + i
@@ -1609,8 +1965,10 @@ def display_bull_dashboard(bull_signals, symbol):
 
     st.markdown("---")
     sc, dc = st.columns([1, 3])
+    n_sig = len(signals)
     with sc:
-        st.metric("整體評分", f"{bull_signals['total_score']:.0f} / 100")
+        st.metric("整體評分", f"{bull_signals['total_score']:.0f} / 100",
+                  delta=f"{sum(1 for s in signals if s['status']=='green')}/{n_sig}項綠燈")
     with dc:
         lvl = bull_signals['conclusion_level']
         if lvl == 'success':
@@ -1638,28 +1996,30 @@ def create_candlestick_chart(df, symbol, rsi_period, currency_symbol,
     show_inst = market == 'tw' and institutional_df is not None and len(institutional_df) > 0
 
     if show_inst:
-        rows = 6
-        row_heights = [0.38, 0.12, 0.12, 0.10, 0.15, 0.13]
+        rows = 7
+        row_heights = [0.32, 0.11, 0.11, 0.10, 0.12, 0.12, 0.12]
         subplot_titles = (
-            f'{symbol} K線 + 布林通道 + MA',
+            f'{symbol} K線 + 布林通道 + MA + VWAP',
             f'RSI ({rsi_period}日)',
             'OBV 量能指標',
             '成交量',
             '三大法人買賣超（張）',
+            'KD 隨機指標（9日）',
             '（預留）'
         )
-        chart_height = 1200
+        chart_height = 1350
     else:
-        rows = 5
-        row_heights = [0.45, 0.15, 0.13, 0.12, 0.15]
+        rows = 6
+        row_heights = [0.35, 0.14, 0.13, 0.12, 0.13, 0.13]
         subplot_titles = (
-            f'{symbol} K線 + 布林通道 + MA',
+            f'{symbol} K線 + 布林通道 + MA + VWAP',
             f'RSI ({rsi_period}日)',
             'OBV 量能指標',
             '成交量',
+            'KD 隨機指標（9日）',
             '（預留）'
         )
-        chart_height = 1100
+        chart_height = 1250
 
     fig = make_subplots(
         rows=rows, cols=1,
@@ -1739,6 +2099,15 @@ def create_candlestick_chart(df, symbol, rsi_period, currency_symbol,
                 line=dict(color=ma_colors[ma], width=2)
             ), row=1, col=1)
 
+    # 1f. VWAP（累積，灰色虛線）
+    if 'VWAP' in df.columns:
+        fig.add_trace(go.Scatter(
+            x=df['date'], y=df['VWAP'],
+            mode='lines', name='VWAP',
+            line=dict(color='#f9ca24', width=1.5, dash='dot'),
+            visible='legendonly'
+        ), row=1, col=1)
+
     # ── Row 2：RSI ──
     rsi_col = f'RSI{rsi_period}'
     if rsi_col in df.columns:
@@ -1808,9 +2177,49 @@ def create_candlestick_chart(df, symbol, rsi_period, currency_symbol,
                 visible='legendonly' if name_key == 'Total' else True
             ), row=5, col=1)
 
+    # ── KD 隨機指標（台股 Row 6, 美股 Row 5）──
+    kd_row = 6 if show_inst else 5
+    if 'KD_K' in df.columns and 'KD_D' in df.columns:
+        fig.add_trace(go.Scatter(
+            x=df['date'], y=df['KD_K'],
+            mode='lines', name='%K',
+            line=dict(color='#ff6b35', width=2)
+        ), row=kd_row, col=1)
+        fig.add_trace(go.Scatter(
+            x=df['date'], y=df['KD_D'],
+            mode='lines', name='%D',
+            line=dict(color='#1e90ff', width=2)
+        ), row=kd_row, col=1)
+        # 超買/超賣基準線
+        for lvl, clr in [(80, 'rgba(255,71,87,0.6)'), (20, 'rgba(46,213,115,0.6)')]:
+            fig.add_hline(y=lvl, line_dash='dash', line_color=clr,
+                          line_width=1, row=kd_row, col=1)
+        fig.add_hrect(y0=80, y1=100, fillcolor='rgba(255,71,87,0.05)',
+                      line_width=0, row=kd_row, col=1)
+        fig.add_hrect(y0=0, y1=20, fillcolor='rgba(46,213,115,0.05)',
+                      line_width=0, row=kd_row, col=1)
+        # 金叉/死叉標記
+        if 'KD_GOLDEN' in df.columns:
+            gd = df[df['KD_GOLDEN']]
+            if not gd.empty:
+                fig.add_trace(go.Scatter(
+                    x=gd['date'], y=gd['KD_K'],
+                    mode='markers', name='KD金叉',
+                    marker=dict(symbol='triangle-up', size=9, color='#f39c12')
+                ), row=kd_row, col=1)
+        if 'KD_DEAD' in df.columns:
+            dd = df[df['KD_DEAD']]
+            if not dd.empty:
+                fig.add_trace(go.Scatter(
+                    x=dd['date'], y=dd['KD_K'],
+                    mode='markers', name='KD死叉',
+                    marker=dict(symbol='triangle-down', size=9, color='#a29bfe')
+                ), row=kd_row, col=1)
+        fig.update_yaxes(range=[0, 100], row=kd_row, col=1)
+
     # ── 佈局更新 ──
     fig.update_layout(
-        title=f'{symbol} 主K線圖（含布林通道、MA、RSI、OBV）',
+        title=f'{symbol} 主K線圖（含布林通道、MA、RSI、OBV、KD）',
         height=chart_height,
         showlegend=True,
         legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
@@ -1823,6 +2232,7 @@ def create_candlestick_chart(df, symbol, rsi_period, currency_symbol,
     fig.update_yaxes(title_text="成交量", row=4, col=1)
     if show_inst:
         fig.update_yaxes(title_text="買賣超（張）", row=5, col=1)
+    fig.update_yaxes(title_text="KD", row=kd_row, col=1)
 
     return fig
 
@@ -2438,184 +2848,6 @@ def create_analyst_chart(analyst_data, symbol, currency_symbol, current_price):
         return None
 
 
-def create_pe_ps_chart(pe_data, symbol, price_df):
-    """
-    P/E 等估值歷年趨勢圖 — 6張分開子圖，共享X軸季度
-    每張子圖：估值指標折線 + 股價折線（右軸），X軸季度格式
-    每季取最高值，每點顯示數值標籤
-    """
-    if pe_data is None or pe_data.get('ratios') is None:
-        return None
-    try:
-        ratios = pe_data['ratios'].copy()
-
-        pe_col  = next((c for c in ['PER', 'priceEarningsRatio'] if c in ratios.columns), None)
-        ps_col  = next((c for c in ['priceToSalesRatio'] if c in ratios.columns), None)
-        pb_col  = next((c for c in ['PBR', 'priceToBookRatio'] if c in ratios.columns), None)
-        dy_col  = next((c for c in ['dividend_yield', 'dividendYield'] if c in ratios.columns), None)
-        peg_col = next((c for c in ['priceEarningsToGrowthRatio', 'pegRatio', 'PEG'] if c in ratios.columns), None)
-
-        if pe_col is None and ps_col is None and pb_col is None:
-            return None
-
-        # 按季度重新取樣，每季取最高值
-        ratios['quarter'] = pd.to_datetime(ratios['date']).dt.to_period('Q').astype(str)
-        ratios['quarter'] = ratios['quarter'].str.replace('Q', '-Q')
-        agg_cols = {c: 'max' for c in ratios.columns if c not in ['date', 'quarter']}
-        ratios = ratios.groupby('quarter', as_index=False).agg(agg_cols)
-        ratios = ratios.sort_values('quarter').reset_index(drop=True)
-        x_vals = ratios['quarter']
-
-        # 季末股價（季度版）
-        quarterly_close = None
-        if price_df is not None and len(price_df) > 0:
-            p_copy = price_df.copy()
-            p_copy['quarter'] = p_copy['date'].dt.to_period('Q').astype(str)
-            p_copy['quarter'] = p_copy['quarter'].str.replace('Q', '-Q')
-            qp = p_copy.groupby('quarter')['close'].last().reset_index()
-            qp = qp.sort_values('quarter').reset_index(drop=True)
-            # 對齊 ratios 的季度
-            qp = qp[qp['quarter'].isin(x_vals)].reset_index(drop=True)
-            quarterly_close = qp
-
-        # 6張子圖，每張雙Y軸（左=估值，右=股價）
-        specs = [[{"secondary_y": True}]] * 6
-        fig = make_subplots(
-            rows=6, cols=1,
-            shared_xaxes=True,
-            vertical_spacing=0.06,
-            subplot_titles=(
-                'PE（本益比）',
-                'PEG（本益成長比）',
-                'PS（股價銷售比）',
-                'PBR（股價淨值比）',
-                'PER / 殖利率（%）',
-                '季末股價'
-            ),
-            specs=specs,
-            row_heights=[1/6]*6
-        )
-
-        def add_val_line(row, y, name, color, fmt='.1f'):
-            """估值指標折線（左軸）+ 每季數值標籤"""
-            y_series = pd.Series(y).reset_index(drop=True)
-            text_vals = [f"{v:{fmt}}" if pd.notna(v) else '' for v in y_series]
-            fig.add_trace(go.Scatter(
-                x=x_vals, y=y_series,
-                mode='lines+markers+text',
-                name=name,
-                line=dict(color=color, width=2),
-                marker=dict(size=5),
-                text=text_vals,
-                textposition='top center',
-                textfont=dict(size=8, color=color),
-                showlegend=(row == 1)  # legend 只在第一張顯示一次
-            ), row=row, col=1, secondary_y=False)
-
-        def add_price_line(row, qc):
-            """股價折線（右軸）每季數值標籤"""
-            if qc is None or len(qc) == 0:
-                return
-            y_p = qc['close']
-            text_p = [f"{v:.0f}" if pd.notna(v) else '' for v in y_p]
-            fig.add_trace(go.Scatter(
-                x=qc['quarter'], y=y_p,
-                mode='lines+markers+text',
-                name='季末股價',
-                line=dict(color='#7f8c8d', width=1.5, dash='dot'),
-                marker=dict(size=4),
-                text=text_p,
-                textposition='bottom center',
-                textfont=dict(size=8, color='#7f8c8d'),
-                showlegend=(row == 1)
-            ), row=row, col=1, secondary_y=True)
-            fig.update_yaxes(title_text='股價', secondary_y=True, row=row, col=1)
-
-        # Row 1: PE
-        if pe_col and ratios[pe_col].notna().sum() > 1:
-            add_val_line(1, ratios[pe_col], 'PE 本益比', '#e74c3c', fmt='.1f')
-            add_price_line(1, quarterly_close)
-            fig.update_yaxes(title_text='PE 倍數', secondary_y=False, row=1, col=1)
-
-        # Row 2: PEG
-        if peg_col and ratios[peg_col].notna().sum() > 1:
-            add_val_line(2, ratios[peg_col], 'PEG 本益成長比', '#9b59b6', fmt='.2f')
-            add_price_line(2, quarterly_close)
-            fig.update_yaxes(title_text='PEG 倍數', secondary_y=False, row=2, col=1)
-        else:
-            fig.add_trace(go.Scatter(x=[], y=[], name='PEG（資料不足）',
-                                     line=dict(color='#9b59b6'), showlegend=False),
-                          row=2, col=1, secondary_y=False)
-
-        # Row 3: PS
-        if ps_col and ratios[ps_col].notna().sum() > 1:
-            add_val_line(3, ratios[ps_col], 'PS 股價銷售比', '#3498db', fmt='.2f')
-            add_price_line(3, quarterly_close)
-            fig.update_yaxes(title_text='PS 倍數', secondary_y=False, row=3, col=1)
-        else:
-            fig.add_trace(go.Scatter(x=[], y=[], name='PS（資料不足）',
-                                     line=dict(color='#3498db'), showlegend=False),
-                          row=3, col=1, secondary_y=False)
-
-        # Row 4: PBR
-        if pb_col and ratios[pb_col].notna().sum() > 1:
-            add_val_line(4, ratios[pb_col], 'PBR 股價淨值比', '#27ae60', fmt='.2f')
-            add_price_line(4, quarterly_close)
-            fig.update_yaxes(title_text='PBR 倍數', secondary_y=False, row=4, col=1)
-        else:
-            fig.add_trace(go.Scatter(x=[], y=[], name='PBR（資料不足）',
-                                     line=dict(color='#27ae60'), showlegend=False),
-                          row=4, col=1, secondary_y=False)
-
-        # Row 5: PER（台股）或殖利率（美股）
-        per_col_tw = 'PER' if 'PER' in ratios.columns else None
-        if per_col_tw and ratios[per_col_tw].notna().sum() > 1 and dy_col is None:
-            add_val_line(5, ratios[per_col_tw], 'PER 本益比', '#f39c12', fmt='.1f')
-            add_price_line(5, quarterly_close)
-            fig.update_yaxes(title_text='PER 倍數', secondary_y=False, row=5, col=1)
-        elif dy_col and ratios[dy_col].notna().sum() > 1:
-            add_val_line(5, ratios[dy_col] * 100, '殖利率（%）', '#f39c12', fmt='.2f')
-            add_price_line(5, quarterly_close)
-            fig.update_yaxes(title_text='殖利率%', secondary_y=False, row=5, col=1)
-        else:
-            fig.add_trace(go.Scatter(x=[], y=[], name='PER/殖利率（資料不足）',
-                                     line=dict(color='#f39c12'), showlegend=False),
-                          row=5, col=1, secondary_y=False)
-
-        # Row 6: 季末股價（單獨一張）
-        if quarterly_close is not None and len(quarterly_close) > 0:
-            y_p6 = quarterly_close['close']
-            text_p6 = [f"{v:.0f}" if pd.notna(v) else '' for v in y_p6]
-            fig.add_trace(go.Scatter(
-                x=quarterly_close['quarter'], y=y_p6,
-                mode='lines+markers+text',
-                name='季末股價（獨立）',
-                line=dict(color='#7f8c8d', width=2),
-                marker=dict(size=5),
-                text=text_p6,
-                textposition='top center',
-                textfont=dict(size=8, color='#7f8c8d'),
-                showlegend=False
-            ), row=6, col=1, secondary_y=False)
-            fig.update_yaxes(title_text='股價', secondary_y=False, row=6, col=1)
-
-        # X 軸：只有最下方（row=6）顯示季度標籤
-        for r in range(1, 6):
-            fig.update_xaxes(showticklabels=False, row=r, col=1)
-        fig.update_xaxes(tickangle=45, showticklabels=True, row=6, col=1)
-
-        fig.update_layout(
-            title=f'{symbol} P/E 等估值歷年趨勢（6張，X軸每季，含相對股價）',
-            height=2400,
-            template='plotly_white',
-            showlegend=True,
-            legend=dict(orientation="h", yanchor="bottom", y=1.01, xanchor="right", x=1)
-        )
-
-        return fig
-    except Exception:
-        return None
-
 
 def create_dmi_chart(df, symbol):
     """
@@ -2671,13 +2903,289 @@ def create_dmi_chart(df, symbol):
 
 
 # ─────────────────────────────────────────────
+# AI 長短線投資建議函數
+# ─────────────────────────────────────────────
+
+
+# ─────────────────────────────────────────────
+# 輔助技術指標圖（CCI / MFI / Williams %R / Aroon）
+# ─────────────────────────────────────────────
+
+def create_oscillator_chart(df, symbol):
+    """
+    4 合 1 輔助震盪指標圖（共享 X 軸）
+    Row 1：CCI(20)  Row 2：MFI(14)  Row 3：Williams %R(14)  Row 4：Aroon(25)
+    """
+    has_cci    = 'CCI20'    in df.columns
+    has_mfi    = 'MFI14'    in df.columns
+    has_willr  = 'WILLR14'  in df.columns
+    has_aroon  = 'AROON_UP' in df.columns
+
+    if not any([has_cci, has_mfi, has_willr, has_aroon]):
+        return None
+
+    try:
+        fig = make_subplots(
+            rows=4, cols=1,
+            shared_xaxes=True,
+            vertical_spacing=0.04,
+            subplot_titles=(
+                'CCI（商品通道指標，20日）',
+                'MFI（資金流量指數，14日）',
+                'Williams %R（14日）',
+                'Aroon（25日）',
+            ),
+            row_heights=[0.25, 0.25, 0.25, 0.25]
+        )
+
+        # ── Row 1：CCI ──
+        if has_cci:
+            cci_colors = ['#ff4757' if v > 100 else ('#2ed573' if v < -100 else '#1e90ff')
+                          for v in df['CCI20'].fillna(0)]
+            fig.add_trace(go.Scatter(
+                x=df['date'], y=df['CCI20'],
+                mode='lines', name='CCI(20)',
+                line=dict(color='#1e90ff', width=2)
+            ), row=1, col=1)
+            for lvl, clr in [(100, 'rgba(255,71,87,0.6)'), (-100, 'rgba(46,213,115,0.6)'), (0, 'gray')]:
+                fig.add_hline(y=lvl, line_dash='dash', line_color=clr, line_width=1, row=1, col=1)
+            fig.add_hrect(y0=100, y1=df['CCI20'].max() * 1.05,
+                          fillcolor='rgba(255,71,87,0.06)', line_width=0, row=1, col=1)
+            fig.add_hrect(y0=df['CCI20'].min() * 1.05, y1=-100,
+                          fillcolor='rgba(46,213,115,0.06)', line_width=0, row=1, col=1)
+            fig.update_yaxes(title_text='CCI', row=1, col=1)
+
+        # ── Row 2：MFI ──
+        if has_mfi:
+            fig.add_trace(go.Scatter(
+                x=df['date'], y=df['MFI14'],
+                mode='lines', name='MFI(14)',
+                line=dict(color='#f9ca24', width=2)
+            ), row=2, col=1)
+            for lvl, clr in [(80, 'rgba(255,71,87,0.6)'), (20, 'rgba(46,213,115,0.6)'), (50, 'gray')]:
+                fig.add_hline(y=lvl, line_dash='dash', line_color=clr, line_width=1, row=2, col=1)
+            fig.add_hrect(y0=80, y1=100, fillcolor='rgba(255,71,87,0.06)', line_width=0, row=2, col=1)
+            fig.add_hrect(y0=0, y1=20,  fillcolor='rgba(46,213,115,0.06)', line_width=0, row=2, col=1)
+            fig.update_yaxes(title_text='MFI', range=[0, 100], row=2, col=1)
+
+        # ── Row 3：Williams %R ──
+        if has_willr:
+            fig.add_trace(go.Scatter(
+                x=df['date'], y=df['WILLR14'],
+                mode='lines', name='Williams %R(14)',
+                line=dict(color='#fd79a8', width=2)
+            ), row=3, col=1)
+            for lvl, clr in [(-20, 'rgba(255,71,87,0.6)'), (-80, 'rgba(46,213,115,0.6)')]:
+                fig.add_hline(y=lvl, line_dash='dash', line_color=clr, line_width=1, row=3, col=1)
+            fig.add_hrect(y0=-20, y1=0,    fillcolor='rgba(255,71,87,0.06)', line_width=0, row=3, col=1)
+            fig.add_hrect(y0=-100, y1=-80, fillcolor='rgba(46,213,115,0.06)', line_width=0, row=3, col=1)
+            fig.update_yaxes(title_text='%R', range=[-100, 0], row=3, col=1)
+
+        # ── Row 4：Aroon ──
+        if has_aroon:
+            fig.add_trace(go.Scatter(
+                x=df['date'], y=df['AROON_UP'],
+                mode='lines', name='Aroon Up',
+                line=dict(color='#00b894', width=2)
+            ), row=4, col=1)
+            if 'AROON_DOWN' in df.columns:
+                fig.add_trace(go.Scatter(
+                    x=df['date'], y=df['AROON_DOWN'],
+                    mode='lines', name='Aroon Down',
+                    line=dict(color='#e17055', width=2)
+                ), row=4, col=1)
+            if 'AROON_OSC' in df.columns:
+                osc_colors = ['#00b894' if v >= 0 else '#e17055' for v in df['AROON_OSC'].fillna(0)]
+                fig.add_trace(go.Bar(
+                    x=df['date'], y=df['AROON_OSC'],
+                    name='Aroon OSC', marker_color=osc_colors, opacity=0.4
+                ), row=4, col=1)
+            fig.add_hline(y=50, line_dash='dot', line_color='gray', line_width=1, row=4, col=1)
+            fig.update_yaxes(title_text='Aroon', range=[0, 100], row=4, col=1)
+
+        fig.update_layout(
+            title=f'{symbol} 輔助震盪指標（CCI / MFI / Williams %R / Aroon）',
+            height=800,
+            showlegend=True,
+            legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+            template='plotly_white'
+        )
+        fig.update_xaxes(rangeslider_visible=False)
+        return fig
+
+    except Exception:
+        return None
+
+
+def generate_investment_advice(symbol, stock_data, openai_api_key, market='us',
+                                bull_signals=None, rsi_period=14,
+                                institutional_df=None, margin_df=None,
+                                financial_data=None, analyst_data=None,
+                                insider_df=None, director_df=None):
+    """
+    獨立呼叫 AI，產生結構化的長線 / 短線投資建議卡片。
+    與 generate_ai_insights 分開，避免篇幅膨脹，專注於可操作建議。
+    """
+    try:
+        client = OpenAI(api_key=openai_api_key)
+
+        currency    = "NT$" if market == 'tw' else "USD"
+        market_desc = "台股" if market == 'tw' else "美股"
+        rsi_col     = f'RSI{rsi_period}'
+        latest_close  = stock_data['close'].iloc[-1]
+        latest_rsi    = stock_data[rsi_col].iloc[-1] if rsi_col in stock_data.columns else 50
+        ma20 = stock_data['MA20'].iloc[-1] if 'MA20' in stock_data.columns else None
+        ma60 = stock_data['MA60'].iloc[-1] if 'MA60' in stock_data.columns else None
+        bb_upper = stock_data['BB_UPPER'].iloc[-1] if 'BB_UPPER' in stock_data.columns else None
+        bb_lower = stock_data['BB_LOWER'].iloc[-1] if 'BB_LOWER' in stock_data.columns else None
+
+        # 基礎摘要
+        summary_lines = [
+            f"股票代碼：{symbol}（{market_desc}）",
+            f"最新收盤：{currency} {latest_close:.2f}",
+            f"RSI({rsi_period})：{latest_rsi:.2f}",
+        ]
+        if ma20: summary_lines.append(f"MA20：{ma20:.2f}")
+        if ma60: summary_lines.append(f"MA60：{ma60:.2f}")
+        if bb_upper and bb_lower:
+            summary_lines.append(f"布林上軌：{bb_upper:.2f}  布林下軌：{bb_lower:.2f}")
+
+        # 多頭訊號
+        if bull_signals:
+            summary_lines.append(
+                f"多頭訊號評分：{bull_signals['total_score']:.0f}/100 — {bull_signals['conclusion']}"
+            )
+
+        # 台股籌碼附加
+        if market == 'tw':
+            if institutional_df is not None and len(institutional_df) > 0:
+                try:
+                    inst_j = institutional_df.tail(10).to_json(orient='records', date_format='iso')
+                    summary_lines.append(f"三大法人近10日：{inst_j}")
+                except Exception:
+                    pass
+            if margin_df is not None and len(margin_df) > 0:
+                try:
+                    mg_j = margin_df.tail(5).to_json(orient='records', date_format='iso')
+                    summary_lines.append(f"融資融券近5日：{mg_j}")
+                except Exception:
+                    pass
+            if financial_data and financial_data.get('quarterly') is not None:
+                try:
+                    fq_j = financial_data['quarterly'].tail(4).to_json(orient='records', date_format='iso')
+                    summary_lines.append(f"近4季財務數據：{fq_j}")
+                except Exception:
+                    pass
+            if director_df is not None and isinstance(director_df, dict):
+                try:
+                    _dir = director_df.get("goodinfo") or director_df.get("mops")
+                    if _dir is not None and len(_dir) > 0:
+                        summary_lines.append(f"董監持股近況：{_dir.head(5).to_json(orient='records', date_format='iso')}")
+                except Exception:
+                    pass
+
+        # 美股分析師目標價
+        if analyst_data is not None:
+            try:
+                con = analyst_data.get('consensus')
+                if con:
+                    summary_lines.append(f"分析師共識：{json.dumps(con, ensure_ascii=False)}")
+            except Exception:
+                pass
+
+        data_summary = "\n".join(summary_lines)
+
+        system_msg = """你是一位資深股票分析師，擅長整合技術面、籌碼面與基本面，給出具體、結構化的投資建議。
+
+重要規則：
+- 使用繁體中文
+- 只輸出格式化的投資建議，不要重複前面已有的技術分析
+- 建議必須包含具體的觀察依據（例如：RSI數值、均線位置、法人動向）
+- 嚴禁「保證獲利」等不當用語；須加上「以上為技術面分析參考，非投資建議，投資有風險」免責聲明
+- 輸出格式嚴格按照下方範本
+"""
+
+        user_msg = f"""根據以下數據，給出{symbol}（{market_desc}）的長短線投資建議：
+
+{data_summary}
+
+請嚴格按照以下 Markdown 格式輸出（不要增加或刪除任何標題層級）：
+
+---
+
+## 🎯 投資建議摘要 — {symbol}
+
+### ⚡ 短線操作建議（1–4週）
+
+**方向**：[偏多 / 偏空 / 觀望]
+**信心度**：[高 / 中 / 低]
+
+**進場條件**：
+- （條件1，需含具體技術數值）
+- （條件2）
+
+**出場 / 停損條件**：
+- 停損：（具體數值或條件）
+- 停利：（具體數值或條件）
+
+**主要依據**：（2–3句說明，引用RSI/MACD/布林通道/成交量等具體數值）
+
+---
+
+### 📈 長線佈局建議（1–6個月）
+
+**方向**：[偏多 / 偏空 / 持平觀察]
+**信心度**：[高 / 中 / 低]
+
+**佈局條件**：
+- （條件1，需含具體技術或基本面數值）
+- （條件2）
+
+**關鍵觀察指標**：
+- （指標1）
+- （指標2）
+- （指標3）
+
+**主要依據**：（3–4句說明，整合技術面、籌碼面、基本面）
+
+---
+
+### ⚠️ 主要風險提示
+
+- （風險1）
+- （風險2）
+- （風險3）
+
+---
+
+> 以上為技術面分析參考，非投資建議，投資有風險，請依個人財務狀況審慎評估。
+
+---
+"""
+
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": system_msg},
+                {"role": "user",   "content": user_msg},
+            ],
+            max_tokens=1200,
+            temperature=0.4
+        )
+        return response.choices[0].message.content
+
+    except Exception as e:
+        return f"⚠️ 投資建議生成失敗：{str(e)}"
+
+
+# ─────────────────────────────────────────────
 # AI 分析函數
 # ─────────────────────────────────────────────
 
 def generate_ai_insights(symbol, stock_data, openai_api_key, start_date, end_date,
                           market='us', margin_df=None, institutional_df=None,
                           financial_data=None, rsi_period=14, bull_signals=None,
-                          insider_df=None, analyst_data=None, pe_data=None,
+                          insider_df=None, analyst_data=None,
                           weekly_df=None, director_df=None):
     try:
         client = OpenAI(api_key=openai_api_key)
@@ -2712,7 +3220,7 @@ def generate_ai_insights(symbol, stock_data, openai_api_key, start_date, end_dat
 4. 教育性技術分析知識（RSI/MACD/BB/OBV/DMI）
 5. 解讀內部人買賣動向的歷史意涵
 6. 描述分析師目標價分布與共識統計
-7. 解讀 P/E、P/S 歷年估值變化特徵，並對應股價走勢同步分析"""
+"""
 
         system_tw_extra = """
 8. 解讀台股籌碼面（三大法人/融資融券）
@@ -2773,13 +3281,6 @@ def generate_ai_insights(symbol, stock_data, openai_api_key, start_date, end_dat
             except Exception:
                 pass
 
-        # P/E P/S
-        if pe_data is not None and pe_data.get('ratios') is not None:
-            try:
-                pe_json = pe_data['ratios'].to_json(orient='records', date_format='iso')
-                user_prompt += f"\n### 歷年 P/E、P/S、P/B 比率\n{pe_json}\n"
-            except Exception:
-                pass
 
         # 台股附加數據
         if market == 'tw':
@@ -2802,13 +3303,32 @@ def generate_ai_insights(symbol, stock_data, openai_api_key, start_date, end_dat
                 q_json = financial_data['quarterly'].to_json(orient='records', date_format='iso')
                 user_prompt += f"\n### 近期季度財務數據（5年20季度，EPS/Revenue/OperatingIncome等）\n{q_json}\n"
 
+        # 新增技術指標數值（KD / CCI / MFI / Williams %R / BIAS / ATR / VWAP）
+        try:
+            extra_indicators = {}
+            for col, label in [
+                ('KD_K', 'KD %K'), ('KD_D', 'KD %D'),
+                ('CCI20', 'CCI(20)'), ('MFI14', 'MFI(14)'),
+                ('WILLR14', 'Williams %R(14)'),
+                ('AROON_UP', 'Aroon Up(25)'), ('AROON_DOWN', 'Aroon Down(25)'),
+                ('BIAS20', 'BIAS20(%)'), ('ATR14', 'ATR(14)'), ('VWAP', 'VWAP'),
+            ]:
+                if col in stock_data.columns:
+                    v = stock_data[col].iloc[-1]
+                    if not pd.isna(v):
+                        extra_indicators[label] = round(float(v), 4)
+            if extra_indicators:
+                user_prompt += f"\n### 新增技術指標最新數值\n{json.dumps(extra_indicators, ensure_ascii=False)}\n"
+        except Exception:
+            pass
+
         # 多頭訊號
         if bull_signals:
             signal_summary = "\n".join([
                 f"- {s['name']}：{'🟢' if s['status']=='green' else ('🟡' if s['status']=='yellow' else '🔴')} {s['desc']}（{s['score']:.0f}分）"
                 for s in bull_signals['signals']
             ])
-            user_prompt += f"\n### 多頭訊號評分結果（整體{bull_signals['total_score']:.0f}/100分）\n{signal_summary}\n結論：{bull_signals['conclusion']}\n"
+            user_prompt += f"\n### 多頭訊號評分結果（整體{bull_signals['total_score']:.0f}/100分，共{len(bull_signals['signals'])}項）\n{signal_summary}\n結論：{bull_signals['conclusion']}\n"
 
         # 分析架構
         conclusion_extra = """
@@ -2850,6 +3370,13 @@ def generate_ai_insights(symbol, stock_data, openai_api_key, start_date, end_dat
 - OBV趨勢與成交量配合度
 - 歷史上量能異常放大時（>全期均量×1.5）的價格後續表現
 
+#### 8b. KD / CCI / MFI / Williams %R 解讀（必要，若有數值）
+- KD(9日)：%K/%D 目前數值、是否超買(>80)或超賣(<20)、近期金叉/死叉
+- CCI(20日)：是否突破+100強勢區間，或跌破-100超賣
+- MFI(14日)：資金流入強度（含量能權重，>80超買/<20超賣）
+- Williams %R(14日)：目前位置（>-20超買，<-80超賣）
+- BIAS20 乖離率：與 MA20 偏離程度，過大有均值回歸風險
+
 #### 9. 布林通道深度分析（必要）
 - 目前股價位於布林通道上軌／中軌／下軌的相對位置
 - 布林通道寬窄（BB_WIDTH）變化：是否處於壓縮期（<均值50%）
@@ -2865,7 +3392,6 @@ def generate_ai_insights(symbol, stock_data, openai_api_key, start_date, end_dat
 - 目標價分布描述、共識評級
 - 外部連結：https://cmnews.com.tw/report 或請搜尋近一個月相關新聞
 
-#### 12. P/E、P/B 歷年估值分析（必要，FinMind PER；需對應股價同步分析）
 - 當前估值與歷史均值比較、估值高低歷史脈絡
 
 #### 13. 籌碼面分析（台股必要）
@@ -2918,6 +3444,13 @@ def generate_ai_insights(symbol, stock_data, openai_api_key, start_date, end_dat
 - OBV趨勢與成交量配合度
 - 歷史上量能異常放大時（>全期均量×1.5）的價格後續表現
 
+#### 8b. KD / CCI / MFI / Williams %R 解讀（必要，若有數值）
+- KD(9日)：%K/%D 目前數值、是否超買(>80)或超賣(<20)、近期金叉/死叉
+- CCI(20日)：是否突破+100強勢區間，或跌破-100超賣
+- MFI(14日)：資金流入強度（含量能權重，>80超買/<20超賣）
+- Williams %R(14日)：目前位置（>-20超買，<-80超賣）
+- BIAS20 乖離率：與 MA20 偏離程度，過大有均值回歸風險
+
 #### 9. 布林通道深度分析（必要）
 - 目前股價位於布林通道上軌／中軌／下軌的相對位置
 - 布林通道寬窄（BB_WIDTH）變化：是否處於壓縮期（<均值50%）
@@ -2933,7 +3466,6 @@ def generate_ai_insights(symbol, stock_data, openai_api_key, start_date, end_dat
 - 目標價分布、共識評級
 - 外部連結：https://cmnews.com.tw/report 或請搜尋近一個月相關新聞
 
-#### 12. P/E、P/S 歷年估值分析（必要，若有資料；需對應股價同步分析）
 - 當前估值與歷史均值比較、估值高低歷史脈絡
 
 #### 13. 價格行為分析
@@ -3099,7 +3631,6 @@ if analyze_button:
                 financial_data   = None
                 insider_df       = None
                 analyst_data     = None
-                pe_data          = None
                 broker_df        = None
                 broker_date      = None
                 director_df      = None
@@ -3134,8 +3665,6 @@ if analyze_button:
                         _mp_df  = _director_result.get("mops")
                         _src    = _director_result.get("source", "none")
 
-                    with st.spinner("正在獲取 P/E 歷史估值數據..."):
-                        pe_data = get_tw_pe_ps_history(symbol.strip(), finmind_api_key)
 
                     status_parts = []
                     if margin_df is not None:         status_parts.append("融資融券")
@@ -3152,7 +3681,6 @@ if analyze_button:
                             status_parts.append(f"董監持股異動-MOPS({_mp_n}筆)")
                     if financial_data and financial_data.get('quarterly') is not None:
                         status_parts.append("財務報表（5年）")
-                    if pe_data is not None:            status_parts.append("P/E歷年估值")
 
                     if status_parts:
                         st.success(f"成功獲取台股附加數據：{'、'.join(status_parts)}")
@@ -3163,13 +3691,10 @@ if analyze_button:
                         insider_df = get_insider_trading(symbol.upper(), fmp_api_key)
                     with st.spinner("正在獲取法人目標價與評級..."):
                         analyst_data = get_analyst_targets(symbol.upper(), fmp_api_key)
-                    with st.spinner("正在獲取 P/E、P/S 歷年估值數據..."):
-                        pe_data = get_pe_ps_history(symbol.upper(), fmp_api_key)
 
                     status_parts = []
                     if insider_df is not None:    status_parts.append(f"內部人買賣（{len(insider_df)}筆）")
                     if analyst_data is not None:  status_parts.append("法人目標價")
-                    if pe_data is not None:        status_parts.append("P/E歷年估值")
                     if status_parts:
                         st.success(f"成功獲取附加數據：{'、'.join(status_parts)}")
 
@@ -3821,79 +4346,162 @@ if analyze_button:
 建議至 SEC FORM 4 連結確認實際申報內容。
 """)
 
-                    # ── 顯示 9：法人目標價（AI 搜尋新聞彙整）──
-                    st.markdown("### 🎯 法人目標價分析（近一個月新聞彙整）")
-                    with st.spinner("AI 正在搜尋近一個月法人目標價新聞..."):
-                        ai_targets = get_analyst_targets_ai(
-                            symbol.upper() if not is_tw else symbol.strip(),
-                            openai_api_key,
-                            market=market_key
-                        )
+                    # ── 顯示 9：法人目標價（多來源整合）──
+                    st.markdown("### 🎯 法人目標價分析")
 
-                    st.caption(f"📅 資料搜尋時間：{ai_targets.get('search_date', '')}，涵蓋近一個月新聞")
-
-                    tgt_table = ai_targets.get('table')
-                    if tgt_table is not None and len(tgt_table) > 0:
-                        # 統計摘要 4 欄
+                    # ── 輔助函式：目標價統計 metrics ──
+                    def _show_price_metrics(df, price_col, currency_sym):
                         prices_raw = []
-                        for v in tgt_table['目標價']:
+                        for v in df[price_col]:
                             try:
-                                num = float(str(v).replace('NT$', '').replace('$', '')
-                                            .replace(',', '').strip())
+                                num = float(str(v).replace('NT$','').replace('$','')
+                                            .replace(',','').strip())
                                 prices_raw.append(num)
                             except Exception:
                                 pass
-
                         m1, m2, m3, m4 = st.columns(4)
-                        with m1:
-                            st.metric("目標價最高",
-                                      f"{currency_symbol}{max(prices_raw):.2f}" if prices_raw else "—")
-                        with m2:
-                            st.metric("目標價最低",
-                                      f"{currency_symbol}{min(prices_raw):.2f}" if prices_raw else "—")
+                        with m1: st.metric("目標價最高", f"{currency_sym}{max(prices_raw):.2f}" if prices_raw else "—")
+                        with m2: st.metric("目標價最低", f"{currency_sym}{min(prices_raw):.2f}" if prices_raw else "—")
                         with m3:
-                            avg_p = sum(prices_raw) / len(prices_raw) if prices_raw else 0
-                            st.metric("目標價均值",
-                                      f"{currency_symbol}{avg_p:.2f}" if prices_raw else "—")
-                        with m4:
-                            st.metric("機構家數", f"{len(tgt_table)} 家")
+                            avg_p = sum(prices_raw)/len(prices_raw) if prices_raw else 0
+                            st.metric("目標價均值", f"{currency_sym}{avg_p:.2f}" if prices_raw else "—")
+                        with m4: st.metric("機構家數", f"{len(df)} 家")
 
-                        st.dataframe(tgt_table, use_container_width=True, hide_index=True)
+                    # ── 決定 tabs 數量（美股 3 tabs / 台股 3 tabs）──
+                    if is_tw:
+                        _tw_sym   = symbol.strip()
+                        _tw_name  = None
+                        try:
+                            _tw_profile = get_tw_company_profile(_tw_sym)
+                            _tw_name    = _tw_profile.get("companyName", "")
+                            if _tw_name == _tw_sym: _tw_name = None
+                        except Exception:
+                            pass
+
+                        _tab_ai, _tab_anue, _tab_goodinfo = st.tabs([
+                            "🤖 AI 新聞彙整", "📰 鉅亨網", "📊 GoodInfo 法人評等"
+                        ])
+
+                        # ── Tab A：AI 搜尋新聞 ──
+                        with _tab_ai:
+                            with st.spinner("AI 正在搜尋近一個月法人目標價新聞..."):
+                                ai_targets = get_analyst_targets_ai(
+                                    _tw_sym, openai_api_key,
+                                    market=market_key, stock_name=_tw_name
+                                )
+                            st.caption(f"📅 資料搜尋時間：{ai_targets.get('search_date','')}，涵蓋近一個月新聞")
+                            tgt_table = ai_targets.get('table')
+                            if tgt_table is not None and len(tgt_table) > 0:
+                                _show_price_metrics(tgt_table, '目標價', currency_symbol)
+                                st.dataframe(tgt_table, use_container_width=True, hide_index=True)
+                            else:
+                                st.warning("⚠️ AI 搜尋未取得資料")
+                                if ai_targets.get('error'):
+                                    with st.expander("🔍 錯誤詳情"): st.code(ai_targets['error'])
+                                st.markdown("🔗 [手動查詢鉅亨網目標價](https://cmnews.com.tw/report)")
+
+                        # ── Tab B：鉅亨網爬蟲 ──
+                        with _tab_anue:
+                            with st.spinner("正在從鉅亨網取得法人評等資料..."):
+                                anue_df, anue_err = get_anue_targets(_tw_sym, _tw_name)
+                            if anue_err:
+                                st.warning(f"⚠️ 鉅亨網：{anue_err}")
+                                st.markdown("🔗 [前往鉅亨網搜尋](https://news.cnyes.com/news/cat/tw_stock_target_price)")
+                            elif anue_df.empty:
+                                st.info("ℹ️ 鉅亨網目前無此股票目標價新聞")
+                            else:
+                                if '目標價' in anue_df.columns:
+                                    _show_price_metrics(anue_df, '目標價', currency_symbol)
+                                st.dataframe(anue_df, use_container_width=True, hide_index=True)
+                                st.caption("資料來源：鉅亨網（cnyes.com），標題擷取，僅供參考")
+                                st.markdown(f"🔗 [前往鉅亨網查詢更多](https://news.cnyes.com/news/cat/tw_stock_target_price)")
+
+                        # ── Tab C：GoodInfo 法人評等 ──
+                        with _tab_goodinfo:
+                            with st.spinner("正在從 GoodInfo 取得法人評等..."):
+                                gi_df, gi_err = get_goodinfo_stock_rating(_tw_sym)
+                            if gi_err:
+                                st.warning(f"⚠️ GoodInfo：{gi_err}")
+                                st.markdown(f"🔗 [GoodInfo 法人評等](https://goodinfo.tw/tw/StockRating.asp?STOCK_ID={_tw_sym})")
+                            elif gi_df.empty:
+                                st.info("ℹ️ GoodInfo 目前無此股票法人評等資料")
+                                st.markdown(f"🔗 [GoodInfo 法人評等](https://goodinfo.tw/tw/StockRating.asp?STOCK_ID={_tw_sym})")
+                            else:
+                                st.dataframe(gi_df, use_container_width=True, hide_index=True)
+                                st.caption(f"資料來源：GoodInfo.tw — 個股法人評等")
+                                st.markdown(f"🔗 [GoodInfo 法人評等（完整頁面）](https://goodinfo.tw/tw/StockRating.asp?STOCK_ID={_tw_sym})")
+
                     else:
-                        st.warning("⚠️ 目前無法取得近期法人目標價，建議手動查詢")
+                        # 美股：3 tabs
+                        _us_sym = symbol.upper()
+                        _tab_ai, _tab_finviz, _tab_fmp = st.tabs([
+                            "🤖 AI 新聞彙整", "📊 Finviz", "🏦 FMP（散點圖）"
+                        ])
 
-                    # 美股同時保留 FMP 散點圖（若有資料）
-                    if not is_tw and analyst_data is not None:
-                        current_price = data_with_indicators['close'].iloc[-1]
-                        analyst_fig = create_analyst_chart(
-                            analyst_data, symbol.upper(), currency_symbol, current_price)
-                        if analyst_fig:
-                            with st.expander("📊 FMP 法人目標價散點圖（展開查看）"):
-                                st.plotly_chart(analyst_fig, use_container_width=True)
-                                con = analyst_data.get('consensus')
-                                if con:
-                                    ec1, ec2, ec3, ec4 = st.columns(4)
-                                    tgt_hi  = con.get('targetHigh') or con.get('targetHighPrice')
-                                    tgt_lo  = con.get('targetLow')  or con.get('targetLowPrice')
-                                    tgt_avg = con.get('targetConsensus') or con.get('targetMean') or con.get('priceTarget')
-                                    rating  = con.get('consensus') or con.get('rating') or '—'
-                                    with ec1: st.metric("目標價最高", f"{currency_symbol}{float(tgt_hi):.2f}" if tgt_hi else "—")
-                                    with ec2: st.metric("目標價最低", f"{currency_symbol}{float(tgt_lo):.2f}" if tgt_lo else "—")
-                                    with ec3: st.metric("目標價均值", f"{currency_symbol}{float(tgt_avg):.2f}" if tgt_avg else "—")
-                                    with ec4: st.metric("共識評級", str(rating))
+                        # ── Tab A：AI 搜尋新聞 ──
+                        with _tab_ai:
+                            with st.spinner("AI 正在搜尋近一個月法人目標價新聞..."):
+                                ai_targets = get_analyst_targets_ai(
+                                    _us_sym, openai_api_key, market=market_key
+                                )
+                            st.caption(f"📅 資料搜尋時間：{ai_targets.get('search_date','')}，涵蓋近一個月新聞")
+                            tgt_table = ai_targets.get('table')
+                            if tgt_table is not None and len(tgt_table) > 0:
+                                _show_price_metrics(tgt_table, '目標價', currency_symbol)
+                                st.dataframe(tgt_table, use_container_width=True, hide_index=True)
+                            else:
+                                st.warning("⚠️ AI 搜尋未取得資料")
+                                if ai_targets.get('error'):
+                                    with st.expander("🔍 錯誤詳情"): st.code(ai_targets['error'])
+                                st.markdown(f"🔗 [手動查詢 Benzinga 目標價](https://www.benzinga.com/stock/{_us_sym.lower()}/analyst-ratings)")
 
-                    # ── 顯示 10：P/E等6張估值趨勢圖 ──
-                    if pe_data is not None:
-                        pe_fig = create_pe_ps_chart(
-                            pe_data,
-                            symbol.upper() if not is_tw else symbol.strip(),
-                            data_with_indicators
-                        )
-                        if pe_fig:
-                            st.markdown("### 📐 P/E 等估值歷年趨勢圖（6張，共享時間軸）")
-                            st.plotly_chart(pe_fig, use_container_width=True)
+                        # ── Tab B：Finviz 爬蟲 ──
+                        with _tab_finviz:
+                            with st.spinner("正在從 Finviz 取得法人評等..."):
+                                fv_df, fv_err = get_finviz_targets(_us_sym)
+                            if fv_err:
+                                st.warning(f"⚠️ Finviz：{fv_err}")
+                                st.markdown(f"🔗 [前往 Finviz 查詢](https://finviz.com/quote.ashx?t={_us_sym})")
+                            elif fv_df.empty:
+                                st.info("ℹ️ Finviz 目前無法人評等資料")
+                                st.markdown(f"🔗 [前往 Finviz 查詢](https://finviz.com/quote.ashx?t={_us_sym})")
+                            else:
+                                if '目標價' in fv_df.columns:
+                                    _show_price_metrics(fv_df, '目標價', currency_symbol)
+                                st.dataframe(fv_df, use_container_width=True, hide_index=True)
+                                st.caption("資料來源：Finviz.com — 法人評等與目標價紀錄（近期）")
+                                st.markdown(f"🔗 [Finviz 完整頁面](https://finviz.com/quote.ashx?t={_us_sym})")
 
-                    # ── 顯示 11：多頭訊號儀表板 ──
+                        # ── Tab C：FMP 散點圖（原邏輯保留）──
+                        with _tab_fmp:
+                            if analyst_data is not None:
+                                current_price = data_with_indicators['close'].iloc[-1]
+                                analyst_fig = create_analyst_chart(
+                                    analyst_data, _us_sym, currency_symbol, current_price)
+                                if analyst_fig:
+                                    st.plotly_chart(analyst_fig, use_container_width=True)
+                                    con = analyst_data.get('consensus')
+                                    if con:
+                                        ec1, ec2, ec3, ec4 = st.columns(4)
+                                        tgt_hi  = con.get('targetHigh') or con.get('targetHighPrice')
+                                        tgt_lo  = con.get('targetLow')  or con.get('targetLowPrice')
+                                        tgt_avg = con.get('targetConsensus') or con.get('targetMean') or con.get('priceTarget')
+                                        rating  = con.get('consensus') or con.get('rating') or '—'
+                                        with ec1: st.metric("目標價最高", f"{currency_symbol}{float(tgt_hi):.2f}" if tgt_hi else "—")
+                                        with ec2: st.metric("目標價最低", f"{currency_symbol}{float(tgt_lo):.2f}" if tgt_lo else "—")
+                                        with ec3: st.metric("目標價均值", f"{currency_symbol}{float(tgt_avg):.2f}" if tgt_avg else "—")
+                                        with ec4: st.metric("共識評級", str(rating))
+                                    # FMP 原始目標價表格
+                                    if analyst_data.get('targets') is not None:
+                                        with st.expander("📋 FMP 目標價明細", expanded=False):
+                                            st.dataframe(analyst_data['targets'], use_container_width=True, hide_index=True)
+                                else:
+                                    st.info("ℹ️ FMP 目標價圖表無法生成")
+                            else:
+                                st.warning("⚠️ FMP 目標價資料未取得（請確認 FMP API Key）")
+                                st.markdown(f"🔗 [FMP {_us_sym} 目標價](https://financialmodelingprep.com/financial-summary/{_us_sym})")
+
+                    # ── 顯示 10：多頭訊號儀表板 ──
                     display_bull_dashboard(bull_signals, symbol.strip() if is_tw else symbol.upper())
 
                     # ── 顯示 12：DMI 圖（含顏色索引）──
@@ -3904,6 +4512,49 @@ if analyze_button:
                     if dmi_fig:
                         st.markdown("### 📈 DMI 趨勢強度指標（14日）")
                         st.plotly_chart(dmi_fig, use_container_width=True)
+
+                    # ── 顯示 12b：輔助震盪指標（CCI / MFI / Williams %R / Aroon）──
+                    osc_fig = create_oscillator_chart(
+                        data_with_indicators,
+                        symbol.strip() if is_tw else symbol.upper()
+                    )
+                    if osc_fig:
+                        st.markdown("### 🔬 輔助震盪指標")
+                        with st.expander("展開查看 CCI / MFI / Williams %R / Aroon 圖表", expanded=False):
+                            st.plotly_chart(osc_fig, use_container_width=True)
+                            st.caption(
+                                "**CCI**：>100 強勢突破；<-100 超賣。"
+                                "**MFI**：>80 超買；<20 超賣（含成交量）。"
+                                "**Williams %R**：>-20 超買；<-80 超賣。"
+                                "**Aroon**：Up>Down 且雙線>50 為多頭確認。"
+                            )
+
+                    # ── 顯示 12c：BIAS 乖離率與 ATR 波動度數值摘要 ──
+                    _bias_ok  = 'BIAS20'  in data_with_indicators.columns
+                    _atr_ok   = 'ATR14'   in data_with_indicators.columns
+                    if _bias_ok or _atr_ok:
+                        st.markdown("#### 📐 乖離率 & 波動度")
+                        _bc1, _bc2, _bc3 = st.columns(3)
+                        if _bias_ok:
+                            _bv = data_with_indicators['BIAS20'].iloc[-1]
+                            with _bc1:
+                                st.metric("BIAS20 乖離率",
+                                          f"{_bv:.2f}%",
+                                          delta="正乖離" if _bv > 0 else "負乖離")
+                        if _atr_ok:
+                            _av = data_with_indicators['ATR14'].iloc[-1]
+                            _cp = data_with_indicators['close'].iloc[-1]
+                            with _bc2:
+                                st.metric("ATR14 真實波動幅",
+                                          f"{_av:.2f}",
+                                          delta=f"≈ {_av/_cp*100:.1f}% of 收盤價")
+                        if 'VWAP' in data_with_indicators.columns:
+                            _vv = data_with_indicators['VWAP'].iloc[-1]
+                            _cp = data_with_indicators['close'].iloc[-1]
+                            with _bc3:
+                                st.metric("VWAP（累積）",
+                                          f"{_vv:.2f}",
+                                          delta=f"{'高於' if _cp > _vv else '低於'} VWAP {abs(_cp-_vv):.2f}")
 
                     # ── 顯示 13：AI 技術分析 ──
                     st.markdown("### 🤖 AI 技術分析")
@@ -3923,7 +4574,6 @@ if analyze_button:
                             bull_signals=bull_signals,
                             insider_df=insider_df,
                             analyst_data=analyst_data,
-                            pe_data=pe_data,
                             weekly_df=weekly_df,
                             director_df=director_df
                         )
@@ -3946,6 +4596,27 @@ if analyze_button:
                     }
                     display_data_fmt = display_data_fmt.rename(columns=col_rename)
                     st.dataframe(display_data_fmt, use_container_width=True, hide_index=True)
+
+                    # ── 顯示 15：長短線投資建議 ──
+                    st.markdown("---")
+                    st.markdown("### 💡 長短線投資建議")
+                    with st.spinner("AI 正在生成長短線投資建議..."):
+                        investment_advice = generate_investment_advice(
+                            symbol=symbol.strip() if is_tw else symbol.upper(),
+                            stock_data=data_with_indicators,
+                            openai_api_key=openai_api_key,
+                            market=market_key,
+                            bull_signals=bull_signals,
+                            rsi_period=rsi_period,
+                            institutional_df=institutional_df if is_tw else None,
+                            margin_df=margin_df if is_tw else None,
+                            financial_data=financial_data if is_tw else None,
+                            analyst_data=analyst_data,
+                            insider_df=insider_df,
+                            director_df=director_df if is_tw else None,
+                        )
+                    if investment_advice:
+                        st.markdown(investment_advice)
 
                     st.success("✅ 分析完成！")
 
@@ -3970,11 +4641,11 @@ if not analyze_button:
 - **進階技術指標**: MACD、布林通道（壓縮突破）、OBV（量價背離）、DMI（含顏色索引）
 - **🚦 多頭訊號儀表板**: 8項指標燈號（🟢🟡🔴）+ 整體評分（0–100分）
 - **台股特有**: 三大法人中文表格+10日加總、季度財務長條圖（5年20季度+股價）
-- **估值分析**: P/E等6張獨立趨勢圖（PE/PEG/PS/PBR/殖利率/年均股價），共享時間軸
 - **內部人分析（T03 強化）**:
   - 美股：SEC Form 4 橫條圖 + 完整明細表 + SEC連結 + 20種交易類型說明
   - 台股：GoodInfo + MOPS 雙來源 + 股東持股分級（FinMind Backer）+ GoodInfo 董監持股
 - **AI智能分析**: gpt-4o-mini 深度分析，結論含股價位階、多頭訊號強弱、中長線勝率
+- **💡 長短線投資建議**: 整合技術/籌碼/基本面，獨立輸出短線（1–4週）與長線（1–6月）操作建議、進出場條件、停損停利與風險提示
 
 ### 📝 使用方法
 1. 在左側選擇市場（美股 / 台股）
