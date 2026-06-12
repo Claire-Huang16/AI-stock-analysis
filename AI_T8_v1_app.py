@@ -308,8 +308,9 @@ def _goodinfo_get(url, params=None, timeout=20):
 
 def _parse_txtStockListData(html):
     """解析 goodinfo StockList 頁面中 #txtStockListData 的表格"""
-    from bs4 import BeautifulSoup
-    soup = BeautifulSoup(html, "html.parser")
+    if not _BS4_OK:
+        return pd.DataFrame()
+    soup = _BS4(html, "html.parser")
     div = soup.find("div", id="txtStockListData")
     if not div:
         return pd.DataFrame()
@@ -330,8 +331,9 @@ def _parse_txtStockListData(html):
 
 def _parse_director_table(html):
     """解析 goodinfo 個股董監持股頁面（StockDirectorSharehold）"""
-    from bs4 import BeautifulSoup
-    soup = BeautifulSoup(html, "html.parser")
+    if not _BS4_OK:
+        return pd.DataFrame()
+    soup = _BS4(html, "html.parser")
     container = (soup.find("div", id="divDetail") or
                  soup.find("table", id="tblDetail") or
                  soup.find("div", id="divStockDetail"))
