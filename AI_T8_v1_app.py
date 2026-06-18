@@ -1945,6 +1945,509 @@ def calculate_bull_signals(df):
     }
 
 
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 朱家泓趨勢線系統 — 多頭確認 / 趨勢轉換 / 進出場判斷
+# 核心規則來源：《趨勢線》教材（轉折波 + 多空確認 + 盤整突破）
+# ─────────────────────────────────────────────────────────────────────────────
+
+def calculate_zhu_trend_system(df):
+    """
+    實作朱家泓趨勢線系統，產生 0–100 分的趨勢評分與進出場建議。
+
+    評分邏輯（共 8 大項，每項滿分依重要性加權）：
+      1. 均線排列結構       15分
+      2. 正 / 負價區         12分
+      3. 短線轉折波方向      15分（頭頭高底底高 / 頭頭低底底低）
+      4. 多頭 / 空頭確認     18分（突破前高 / 跌破前低）
+      5. 趨勢轉換偵測        10分（空轉多 / 多轉空）
+      6. 盤整突破訊號        12分（橫盤後突破上緣）
+      7. 成交量確認           8分（突破量 > 均量）
+      8. 月線方向             10分（長線多空）
+
+    總分 ≥ 50 → 進場（做多），< 50 → 出場 / 觀望。
+    """
+
+    result = {
+        'score': 0,
+        'max_score': 100,
+        'items': [],         # [{name, score, max, status, desc}]
+        'trend': 'neutral',  # 'bull' / 'bear' / 'neutral'
+        'transition': None,  # '空轉多' / '多轉空' / None
+        'action': 'hold',    # 'enter_long' / 'exit' / 'hold'
+        'action_color': 'yellow',
+        'action_label': '⚪ 觀望',
+        'consolidation_breakout': False,
+        'detail': {},
+    }
+
+    def add_item(name, score, max_score, status, desc):
+        result['items'].append({
+            'name': name, 'score': score, 'max': max_score,
+            'status': status, 'desc': desc
+        })
+        result['score'] += score
+
+    close  = df['close']
+    high   = df['high']
+    low    = df['low']
+    n      = len(df)
+
+    if n < 30:
+        result['action'] = 'hold'
+        result['action_label'] = '⚪ 資料不足'
+        return result
+
+    c     = close.iloc[-1]
+    c_arr = close.values
+
+    # ─── 1. 均線排列結構（15分）───────────────────────────────
+    try:
+        ma5  = close.rolling(5).mean().iloc[-1]
+        ma10 = close.rolling(10).mean().iloc[-1]
+        ma20 = close.rolling(20).mean().iloc[-1]
+        ma60 = close.rolling(60).mean().iloc[-1] if n >= 60 else None
+
+        if ma60 is not None:
+            if c > ma5 > ma10 > ma20 > ma60:
+                add_item('均線排列', 15, 15, 'green', '完全多頭排列 MA5>MA10>MA20>MA60')
+            elif c > ma5 > ma20:
+                add_item('均線排列', 8, 15, 'yellow', 'MA5>MA20，部分多頭，MA60未確認')
+            elif c < ma5 < ma10 < ma20:
+                add_item('均線排列', 0, 15, 'red', '完全空頭排列，均線壓制')
+            else:
+                add_item('均線排列', 4, 15, 'yellow', '均線交錯，趨勢不明')
+        else:
+            if c > ma5 > ma10 > ma20:
+                add_item('均線排列', 12, 15, 'green', '短中期多頭排列（MA60資料不足）')
+            elif c > ma20:
+                add_item('均線排列', 6, 15, 'yellow', '股價在MA20上方')
+            else:
+                add_item('均線排列', 0, 15, 'red', '股價在MA20下方')
+        result['detail']['ma5']  = ma5
+        result['detail']['ma10'] = ma10
+        result['detail']['ma20'] = ma20
+        result['detail']['ma60'] = ma60
+    except Exception:
+        add_item('均線排列', 0, 15, 'red', '無法計算')
+
+    # ─── 2. 正 / 負價區（5日均線上下）（12分）────────────────
+    try:
+        ma5_s = close.rolling(5).mean()
+        above_ma5 = (close > ma5_s).tail(3).sum()   # 近3日在5均上方天數
+        if above_ma5 == 3:
+            add_item('正/負價區', 12, 12, 'green', '近3日全在5均上方（正價區）')
+        elif above_ma5 >= 2:
+            add_item('正/負價區', 7,  12, 'yellow', f'近3日{above_ma5}日在5均上方，正價區偏弱')
+        elif above_ma5 == 1:
+            add_item('正/負價區', 3,  12, 'yellow', '剛突破5均，確認中')
+        else:
+            add_item('正/負價區', 0,  12, 'red',    '近3日全在5均下方（負價區）')
+        result['detail']['above_ma5_days'] = int(above_ma5)
+    except Exception:
+        add_item('正/負價區', 0, 12, 'red', '無法計算')
+
+    # ─── 3. 短線轉折波方向（頭頭高底底高 vs 頭頭低底底低）（15分）
+    # 邏輯：取近20根K線，找出局部高低點，判斷趨勢方向
+    try:
+        window = min(40, n)
+        h_arr  = high.values[-window:]
+        l_arr  = low.values[-window:]
+        c_sub  = c_arr[-window:]
+
+        # 找局部高點（前後各2根比較）
+        local_highs = []
+        local_lows  = []
+        for i in range(2, len(h_arr) - 2):
+            if h_arr[i] >= max(h_arr[i-2:i]) and h_arr[i] >= max(h_arr[i+1:i+3]):
+                local_highs.append((i, h_arr[i]))
+            if l_arr[i] <= min(l_arr[i-2:i]) and l_arr[i] <= min(l_arr[i+1:i+3]):
+                local_lows.append((i, l_arr[i]))
+
+        # 取最近 3 個高低點判斷方向
+        bull_wave = False
+        bear_wave = False
+        wave_desc = '轉折波方向不明'
+
+        if len(local_highs) >= 2 and len(local_lows) >= 2:
+            h_vals = [v for _, v in local_highs[-3:]]
+            l_vals = [v for _, v in local_lows[-3:]]
+            h_rising = all(h_vals[i] < h_vals[i+1] for i in range(len(h_vals)-1))
+            l_rising = all(l_vals[i] < l_vals[i+1] for i in range(len(l_vals)-1))
+            h_falling= all(h_vals[i] > h_vals[i+1] for i in range(len(h_vals)-1))
+            l_falling= all(l_vals[i] > l_vals[i+1] for i in range(len(l_vals)-1))
+
+            if h_rising and l_rising:
+                bull_wave  = True
+                wave_desc  = f'頭頭高({h_vals[-1]:.2f})底底高({l_vals[-1]:.2f})，多頭轉折波確認'
+            elif h_falling and l_falling:
+                bear_wave  = True
+                wave_desc  = f'頭頭低({h_vals[-1]:.2f})底底低({l_vals[-1]:.2f})，空頭轉折波確認'
+            elif l_rising:
+                wave_desc  = f'底底高({l_vals[-1]:.2f})，下方支撐增強'
+            elif h_falling:
+                wave_desc  = f'頭頭低({h_vals[-1]:.2f})，上方壓力增強'
+
+        result['detail']['bull_wave'] = bull_wave
+        result['detail']['bear_wave'] = bear_wave
+
+        if bull_wave:
+            add_item('轉折波方向', 15, 15, 'green',  wave_desc)
+        elif not bear_wave and not bull_wave:
+            add_item('轉折波方向', 6,  15, 'yellow', wave_desc)
+        else:
+            add_item('轉折波方向', 0,  15, 'red',    wave_desc)
+    except Exception:
+        add_item('轉折波方向', 0, 15, 'red', '無法計算')
+
+    # ─── 4. 多頭確認 / 空頭確認（18分）────────────────────────
+    # 多頭確認：收盤突破近期高點（20日最高），且5均向上
+    # 空頭確認：收盤跌破近期低點（20日最低），且5均向下
+    try:
+        look = min(20, n - 1)
+        recent_high = high.iloc[-look-1:-1].max()
+        recent_low  = low.iloc[-look-1:-1].min()
+        ma5_dir     = close.rolling(5).mean().diff(3).iloc[-1]  # MA5 3日斜率
+
+        bull_confirm = c > recent_high and ma5_dir > 0
+        bear_confirm = c < recent_low  and ma5_dir < 0
+
+        result['detail']['recent_high'] = recent_high
+        result['detail']['recent_low']  = recent_low
+        result['detail']['ma5_slope']   = ma5_dir
+
+        if bull_confirm:
+            add_item('多/空頭確認', 18, 18, 'green',
+                     f'突破近{look}日高點{recent_high:.2f}，MA5向上 → 多頭確認')
+        elif c > recent_high:
+            add_item('多/空頭確認', 10, 18, 'yellow',
+                     f'突破近期高點{recent_high:.2f}，但MA5尚未轉向')
+        elif bear_confirm:
+            add_item('多/空頭確認', 0,  18, 'red',
+                     f'跌破近{look}日低點{recent_low:.2f}，MA5向下 → 空頭確認')
+        elif c < recent_low:
+            add_item('多/空頭確認', 0,  18, 'red',
+                     f'跌破近期低點{recent_low:.2f}')
+        else:
+            add_item('多/空頭確認', 5,  18, 'yellow',
+                     f'在近期區間內（高:{recent_high:.2f} 低:{recent_low:.2f}）')
+    except Exception:
+        add_item('多/空頭確認', 0, 18, 'red', '無法計算')
+
+    # ─── 5. 趨勢轉換偵測（10分）────────────────────────────────
+    # 空轉多：近5日有大量長紅K突破前高；多轉空：近5日有大量長黑K跌破前低
+    try:
+        avg_vol = df['volume'].mean()
+        recent5 = df.tail(5)
+        transition = None
+        trans_score = 4
+        trans_desc  = '無明顯趨勢轉換訊號'
+        trans_status= 'yellow'
+
+        for _, row in recent5.iterrows():
+            body     = abs(row['close'] - row['open'])
+            body_pct = body / row['open'] * 100 if row['open'] > 0 else 0
+            vol_surge= row['volume'] > avg_vol * 1.5
+            red_k    = row['close'] > row['open'] and body_pct > 2 and vol_surge
+            black_k  = row['close'] < row['open'] and body_pct > 2 and vol_surge
+
+            if red_k and row['close'] > recent_high:
+                transition    = '空轉多'
+                trans_score   = 10
+                trans_desc    = f"大量長紅K突破前高{recent_high:.2f}，空轉多訊號"
+                trans_status  = 'green'
+                break
+            elif black_k and row['close'] < recent_low:
+                transition    = '多轉空'
+                trans_score   = 0
+                trans_desc    = f"大量長黑K跌破前低{recent_low:.2f}，多轉空訊號"
+                trans_status  = 'red'
+                break
+
+        result['transition'] = transition
+        add_item('趨勢轉換', trans_score, 10, trans_status, trans_desc)
+    except Exception:
+        add_item('趨勢轉換', 0, 10, 'red', '無法計算')
+
+    # ─── 6. 盤整突破訊號（12分）───────────────────────────────
+    # 判斷近10根K線是否為窄幅橫盤，且最新K線突破橫盤上緣
+    try:
+        consolidation_window = min(10, n - 1)
+        recent10_high = high.iloc[-consolidation_window-1:-1]
+        recent10_low  = low.iloc[-consolidation_window-1:-1]
+        range_pct     = (recent10_high.max() - recent10_low.min()) / recent10_low.min() * 100
+
+        is_consolidated = range_pct < 8.0    # 振幅 < 8% 視為橫盤
+        breakout_up     = c > recent10_high.max()
+        breakout_down   = c < recent10_low.min()
+
+        result['consolidation_breakout'] = is_consolidated and breakout_up
+        result['detail']['consolidation_range_pct'] = range_pct
+
+        if is_consolidated and breakout_up:
+            add_item('盤整突破', 12, 12, 'green',
+                     f'近{consolidation_window}根振幅{range_pct:.1f}%盤整後向上突破')
+        elif is_consolidated and breakout_down:
+            add_item('盤整突破', 0,  12, 'red',
+                     f'近{consolidation_window}根振幅{range_pct:.1f}%盤整後向下跌破')
+        elif is_consolidated:
+            add_item('盤整突破', 5,  12, 'yellow',
+                     f'正處橫盤整理（振幅{range_pct:.1f}%），等待突破方向')
+        else:
+            add_item('盤整突破', 3,  12, 'yellow',
+                     f'非橫盤狀態（振幅{range_pct:.1f}%），正常趨勢行進中')
+    except Exception:
+        add_item('盤整突破', 0, 12, 'red', '無法計算')
+
+    # ─── 7. 成交量確認（8分）──────────────────────────────────
+    try:
+        avg_vol5  = df['volume'].tail(5).mean()
+        avg_volN  = df['volume'].mean()
+        vol_ratio = avg_vol5 / avg_volN if avg_volN > 0 else 1.0
+        result['detail']['vol_ratio'] = vol_ratio
+
+        if vol_ratio >= 1.5 and c > close.shift(1).iloc[-1]:
+            add_item('成交量確認', 8, 8, 'green',
+                     f'近5日均量是全期{vol_ratio:.1f}倍，量增價漲')
+        elif vol_ratio >= 1.2 and c > close.shift(1).iloc[-1]:
+            add_item('成交量確認', 5, 8, 'yellow',
+                     f'量溫和放大{vol_ratio:.1f}倍，量價偏多')
+        elif vol_ratio < 0.7:
+            add_item('成交量確認', 2, 8, 'yellow',
+                     f'量能萎縮（近5日均量僅全期{vol_ratio:.1f}倍）')
+        elif vol_ratio >= 1.5 and c < close.shift(1).iloc[-1]:
+            add_item('成交量確認', 0, 8, 'red',
+                     f'量大價跌（{vol_ratio:.1f}倍量），賣壓沉重')
+        else:
+            add_item('成交量確認', 3, 8, 'yellow',
+                     f'量能正常（{vol_ratio:.1f}倍）')
+    except Exception:
+        add_item('成交量確認', 0, 8, 'red', '無法計算')
+
+    # ─── 8. 月線方向（長線多空基礎）（10分）─────────────────────
+    try:
+        if n >= 20:
+            ma20_now  = close.rolling(20).mean().iloc[-1]
+            ma20_prev = close.rolling(20).mean().iloc[-6]  # 6日前斜率
+            ma20_slope= (ma20_now - ma20_prev) / ma20_prev * 100
+
+            if ma20_slope > 1.0 and c > ma20_now:
+                add_item('月線方向', 10, 10, 'green',
+                         f'MA20向上斜率{ma20_slope:.1f}%，股價在月線上')
+            elif ma20_slope > 0 and c > ma20_now:
+                add_item('月線方向', 7,  10, 'green',
+                         f'MA20緩升，股價在月線上')
+            elif ma20_slope < -1.0 and c < ma20_now:
+                add_item('月線方向', 0,  10, 'red',
+                         f'MA20向下斜率{ma20_slope:.1f}%，股價在月線下')
+            elif c < ma20_now:
+                add_item('月線方向', 2,  10, 'red',
+                         f'股價在月線下方（斜率{ma20_slope:.1f}%）')
+            else:
+                add_item('月線方向', 5,  10, 'yellow',
+                         f'MA20持平（斜率{ma20_slope:.1f}%）')
+        else:
+            add_item('月線方向', 3, 10, 'yellow', '資料不足20日')
+    except Exception:
+        add_item('月線方向', 0, 10, 'red', '無法計算')
+
+    # ─── 彙整趨勢方向 ───────────────────────────────────────────
+    score = result['score']
+    bull_wave  = result['detail'].get('bull_wave', False)
+    bear_wave  = result['detail'].get('bear_wave', False)
+
+    if score >= 70:
+        result['trend'] = 'bull'
+    elif score <= 35:
+        result['trend'] = 'bear'
+    else:
+        result['trend'] = 'neutral'
+
+    # ─── 進出場判斷 ─────────────────────────────────────────────
+    if score >= 80:
+        result['action']        = 'enter_long'
+        result['action_color']  = 'green'
+        result['action_label']  = '🟢 強烈進場（信心高）'
+    elif score >= 65:
+        result['action']        = 'enter_long'
+        result['action_color']  = 'green'
+        result['action_label']  = '🟢 進場（信心中高）'
+    elif score >= 50:
+        result['action']        = 'enter_long'
+        result['action_color']  = 'yellow'
+        result['action_label']  = '🟡 可考慮進場（信心中等，謹慎）'
+    elif score >= 35:
+        result['action']        = 'exit'
+        result['action_color']  = 'orange'
+        result['action_label']  = '🟠 考慮出場 / 減碼'
+    else:
+        result['action']        = 'exit'
+        result['action_color']  = 'red'
+        result['action_label']  = '🔴 出場 / 觀望（偏空）'
+
+    # 趨勢轉換強制覆蓋
+    if result['transition'] == '空轉多' and score >= 50:
+        result['action_label'] = '🚀 ' + result['action_label'] + ' ＋空轉多確認加持'
+    elif result['transition'] == '多轉空':
+        result['action']       = 'exit'
+        result['action_label'] = '🔴 出場（多轉空訊號，優先出場）'
+
+    return result
+
+
+def display_zhu_trend_dashboard(zhu_result, symbol, currency_symbol='$'):
+    """
+    顯示朱家泓趨勢線系統的分析儀表板。
+    獨立於現有多頭訊號儀表板，專注於趨勢 + 進出場判斷。
+    """
+    st.markdown("---")
+    st.markdown("### 📐 朱家泓趨勢線系統分析")
+
+    score     = zhu_result['score']
+    max_score = zhu_result['max_score']
+    action    = zhu_result['action_label']
+    trend     = zhu_result['trend']
+    items     = zhu_result['items']
+    transition= zhu_result['transition']
+
+    # ── 頂部：分數 + 進出場判斷 ──────────────────────────────────
+    col_score, col_action = st.columns([1, 2])
+
+    with col_score:
+        # 顏色漸層：紅→橙→黃→綠
+        if score >= 65:
+            bar_color = '#2ed573'
+        elif score >= 50:
+            bar_color = '#f9ca24'
+        elif score >= 35:
+            bar_color = '#ff7f50'
+        else:
+            bar_color = '#ff4757'
+
+        st.markdown(f"""
+        <div style="
+            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+            border-radius: 16px;
+            padding: 20px;
+            text-align: center;
+            border: 2px solid {bar_color};
+        ">
+            <div style="font-size:13px;color:#aaa;margin-bottom:4px;">趨勢系統評分</div>
+            <div style="font-size:52px;font-weight:900;color:{bar_color};line-height:1;">
+                {score}
+            </div>
+            <div style="font-size:13px;color:#777;">/ {max_score} 分</div>
+            <div style="margin-top:10px;">
+                <div style="background:#333;border-radius:6px;height:8px;">
+                    <div style="background:{bar_color};width:{score}%;height:8px;border-radius:6px;"></div>
+                </div>
+            </div>
+            <div style="margin-top:10px;font-size:12px;color:#aaa;">
+                {"🐂 多頭趨勢" if trend=="bull" else ("🐻 空頭趨勢" if trend=="bear" else "⚖️ 中性整理")}
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+    with col_action:
+        # 進出場建議卡片
+        border_c = '#2ed573' if 'green' in zhu_result['action_color'] or score >= 65 else                    ('#f9ca24' if score >= 50 else '#ff4757')
+
+        # 進出場門檻說明
+        if score >= 50:
+            signal_text = f"✅ 評分 {score} ≥ 50，達進場門檻"
+            signal_color= '#2ed573'
+        else:
+            signal_text = f"⛔ 評分 {score} < 50，未達進場門檻"
+            signal_color= '#ff4757'
+
+        st.markdown(f"""
+        <div style="
+            background:linear-gradient(135deg,#1a1a2e,#16213e);
+            border-radius:16px;padding:20px;
+            border:2px solid {border_c};height:100%;
+        ">
+            <div style="font-size:13px;color:#aaa;margin-bottom:8px;">📍 進出場判斷</div>
+            <div style="font-size:22px;font-weight:700;color:{border_c};margin-bottom:12px;">
+                {action}
+            </div>
+            <div style="font-size:13px;color:{signal_color};margin-bottom:8px;">
+                {signal_text}
+            </div>
+            <div style="font-size:12px;color:#888;border-top:1px solid #333;padding-top:8px;">
+                50分以上進場 ｜ 50分以下出場<br>
+                分數越高信心越強，反之亦然
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+    # ── 趨勢轉換特別提示 ────────────────────────────────────────
+    if transition:
+        color = '#2ed573' if transition == '空轉多' else '#ff4757'
+        icon  = '🚀' if transition == '空轉多' else '⚠️'
+        st.markdown(f"""
+        <div style="margin:12px 0;padding:12px 18px;
+            background:linear-gradient(90deg,{color}22,transparent);
+            border-left:4px solid {color};border-radius:0 8px 8px 0;font-size:14px;color:{color};">
+            {icon} <b>趨勢轉換偵測：{transition}</b>
+            &nbsp;—&nbsp;{next((i['desc'] for i in items if i['name']=='趨勢轉換'),'')}</div>
+        """, unsafe_allow_html=True)
+
+    if zhu_result.get('consolidation_breakout'):
+        st.markdown("""
+        <div style="margin:6px 0;padding:10px 18px;
+            background:linear-gradient(90deg,#a29bfe22,transparent);
+            border-left:4px solid #a29bfe;border-radius:0 8px 8px 0;font-size:13px;color:#a29bfe;">
+            💡 <b>盤整突破訊號</b> — 橫盤整理後向上突破，量能配合效果更佳</div>
+        """, unsafe_allow_html=True)
+
+    st.markdown("<div style='margin-top:16px;'></div>", unsafe_allow_html=True)
+
+    # ── 8 項細項評分表格（動態行，每排 4 格）──────────────────
+    status_emoji = {'green': '🟢', 'yellow': '🟡', 'red': '🔴'}
+    for row_start in range(0, len(items), 4):
+        cols = st.columns(4)
+        for i, col in enumerate(cols):
+            idx = row_start + i
+            if idx < len(items):
+                itm = items[idx]
+                pct = itm['score'] / itm['max'] * 100 if itm['max'] > 0 else 0
+                with col:
+                    st.metric(
+                        label=f"{status_emoji[itm['status']]} {itm['name']}",
+                        value=f"{itm['score']:.0f} / {itm['max']:.0f}",
+                        delta=itm['desc'],
+                        delta_color='normal'
+                    )
+
+    # ── 說明區塊（折疊）─────────────────────────────────────────
+    with st.expander("📖 評分規則說明（朱家泓趨勢線系統）", expanded=False):
+        st.markdown("""
+**系統核心理念**（來源：朱家泓《趨勢線》教材）
+
+| 項目 | 滿分 | 核心判斷邏輯 |
+|---|---|---|
+| 均線排列 | 15 | MA5>MA10>MA20>MA60 = 完全多頭排列 |
+| 正/負價區 | 12 | 股價在5日均線上方（正價區）= 多頭有利 |
+| 轉折波方向 | 15 | 頭頭高底底高 = 多頭；頭頭低底底低 = 空頭 |
+| 多/空頭確認 | 18 | 突破近20日高點且MA5向上 = 多頭確認 |
+| 趨勢轉換 | 10 | 大量長紅K突破前高 = 空轉多；反之 = 多轉空 |
+| 盤整突破 | 12 | 振幅<8%橫盤後向上突破 = 盤整突破訊號 |
+| 成交量確認 | 8 | 近5日均量 > 全期均量1.5倍且價漲 |
+| 月線方向 | 10 | MA20向上且股價在月線上方 |
+
+**進出場判斷**：
+- 🟢 **≥ 65分**：強信心，積極進場做多
+- 🟡 **50–64分**：中等信心，謹慎進場
+- 🟠 **35–49分**：考慮出場 / 減碼
+- 🔴 **< 35分**：偏空，觀望或出場
+
+> ⚠️ 以上為技術面分析，非投資建議，投資有風險，請依個人財務狀況審慎評估。
+        """)
+
+    st.caption(f"📅 趨勢系統評分時間：{datetime.now().strftime('%Y-%m-%d %H:%M')}")
+
+
 def display_bull_dashboard(bull_signals, symbol):
     st.markdown("### 🚦 多頭訊號儀表板")
     emoji_map = {'green': '🟢', 'yellow': '🟡', 'red': '🔴'}
@@ -3019,7 +3522,7 @@ def create_oscillator_chart(df, symbol):
         return None
 
 
-def generate_investment_advice(symbol, stock_data, openai_api_key, market='us',
+def generate_investment_advice(symbol, stock_data, openai_api_key, market='us', zhu_result=None,
                                 bull_signals=None, rsi_period=14,
                                 institutional_df=None, margin_df=None,
                                 financial_data=None, analyst_data=None,
@@ -3057,6 +3560,16 @@ def generate_investment_advice(symbol, stock_data, openai_api_key, market='us',
             summary_lines.append(
                 f"多頭訊號評分：{bull_signals['total_score']:.0f}/100 — {bull_signals['conclusion']}"
             )
+
+        # 朱家泓趨勢系統摘要
+        if zhu_result:
+            summary_lines.append(
+                f"朱家泓趨勢系統評分：{zhu_result['score']}/100 — {zhu_result['action_label']}"
+            )
+            if zhu_result.get('transition'):
+                summary_lines.append(f"趨勢轉換偵測：{zhu_result['transition']}")
+            if zhu_result.get('consolidation_breakout'):
+                summary_lines.append("盤整突破訊號：已確認")
 
         # 台股籌碼附加
         if market == 'tw':
@@ -3626,6 +4139,7 @@ if analyze_button:
 
                 # ── Step 5: 計算多頭訊號 ──
                 bull_signals = calculate_bull_signals(data_with_indicators)
+                zhu_result   = calculate_zhu_trend_system(data_with_indicators)
 
                 # ── Step 6: 籌碼/附加數據 ──
                 margin_df        = None
@@ -4506,6 +5020,13 @@ if analyze_button:
                     # ── 顯示 10：多頭訊號儀表板 ──
                     display_bull_dashboard(bull_signals, symbol.strip() if is_tw else symbol.upper())
 
+                    # ── 顯示 11：朱家泓趨勢線系統 ──
+                    display_zhu_trend_dashboard(
+                        zhu_result,
+                        symbol.strip() if is_tw else symbol.upper(),
+                        currency_symbol=currency_symbol
+                    )
+
                     # ── 顯示 12：DMI 圖（含顏色索引）──
                     dmi_fig = create_dmi_chart(
                         data_with_indicators,
@@ -4609,6 +5130,7 @@ if analyze_button:
                             openai_api_key=openai_api_key,
                             market=market_key,
                             bull_signals=bull_signals,
+                            zhu_result=zhu_result,
                             rsi_period=rsi_period,
                             institutional_df=institutional_df if is_tw else None,
                             margin_df=margin_df if is_tw else None,
