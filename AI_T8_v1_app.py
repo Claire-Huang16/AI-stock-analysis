@@ -2302,7 +2302,7 @@ def display_zhu_trend_dashboard(zhu_result, symbol, currency_symbol='$'):
     獨立於現有多頭訊號儀表板，專注於趨勢 + 進出場判斷。
     """
     st.markdown("---")
-    st.markdown("### 📐 朱家泓趨勢線系統分析")
+    st.markdown("### 📐 趨勢線系統分析")
 
     score     = zhu_result['score']
     max_score = zhu_result['max_score']
@@ -3528,8 +3528,8 @@ def generate_stock_evaluation(symbol, stock_data, openai_api_key, market='us',
                                weekly_df=None, financial_data=None,
                                analyst_data=None, insider_df=None, director_df=None):
     """
-    使用 AI 自動填入朱家泓選股評量表格的所有欄位，回傳 dict。
-    欄位對應圖表10-3-1：波型/位置/K線/均線/成交量/指標/支撐/壓力/背離/融資融券/法人/型態/策略
+    使用 AI 自動填入朱家泓選股評量表格（圖表10-3-1）所有欄位，回傳 dict。
+    提供豐富原始數值讓 AI 輸出如範例所示的具體描述（含價位、張數、KD值等）。
     """
     try:
         client = OpenAI(api_key=openai_api_key)
@@ -3537,165 +3537,259 @@ def generate_stock_evaluation(symbol, stock_data, openai_api_key, market='us',
         market_desc = "台股" if market == 'tw' else "美股"
         rsi_col     = f'RSI{rsi_period}'
 
-        # ── 收集數值摘要 ──
-        d  = stock_data
-        ld = d.iloc[-1]   # latest day
-        close   = float(ld['close'])
-        rsi_val = float(d[rsi_col].iloc[-1]) if rsi_col in d.columns else None
-        ma5     = float(d['MA5'].iloc[-1])  if 'MA5'  in d.columns else None
-        ma10    = float(d['MA10'].iloc[-1]) if 'MA10' in d.columns else None
-        ma20    = float(d['MA20'].iloc[-1]) if 'MA20' in d.columns else None
-        ma60    = float(d['MA60'].iloc[-1]) if 'MA60' in d.columns else None
-        bb_u    = float(d['BB_UPPER'].iloc[-1]) if 'BB_UPPER' in d.columns else None
-        bb_l    = float(d['BB_LOWER'].iloc[-1]) if 'BB_LOWER' in d.columns else None
-        bb_m    = float(d['BB_MID'].iloc[-1])   if 'BB_MID'   in d.columns else None
-        macd_dif  = float(d['MACD_DIF'].iloc[-1])  if 'MACD_DIF'  in d.columns else None
-        macd_line = float(d['MACD_LINE'].iloc[-1]) if 'MACD_LINE' in d.columns else None
-        macd_hist = float(d['MACD_HIST'].iloc[-1]) if 'MACD_HIST' in d.columns else None
-        obv_val   = float(d['OBV'].iloc[-1]) if 'OBV' in d.columns else None
-        adx_val   = float(d['ADX'].iloc[-1]) if 'ADX' in d.columns else None
-        vol_5avg  = float(d['volume'].tail(5).mean())  if 'volume' in d.columns else None
-        vol_20avg = float(d['volume'].tail(20).mean()) if 'volume' in d.columns else None
-        vol_today = float(d['volume'].iloc[-1]) if 'volume' in d.columns else None
+        d = stock_data
+        # ── 近5根日K線 ──
+        recent5 = d.tail(5)[['date','open','high','low','close','volume']].copy()
+        recent5['date'] = recent5['date'].dt.strftime('%Y-%m-%d')
+        recent5_str = recent5.to_string(index=False)
 
-        # 週線摘要
-        w_macd_dif  = None; w_macd_line = None; w_kd_k = None; w_kd_d = None
-        w_ma20      = None; w_close     = None
+        close      = float(d['close'].iloc[-1])
+        high_today = float(d['high'].iloc[-1])
+        low_today  = float(d['low'].iloc[-1])
+
+        def _v(col):  return float(d[col].iloc[-1])  if col in d.columns else None
+        def _v2(col): return float(d[col].iloc[-2])  if col in d.columns and len(d)>=2 else None
+
+        ma5=_v('MA5'); ma5p=_v2('MA5'); ma10=_v('MA10'); ma10p=_v2('MA10')
+        ma20=_v('MA20'); ma20p=_v2('MA20'); ma60=_v('MA60'); ma60p=_v2('MA60')
+        bb_u=_v('BB_UPPER'); bb_m=_v('BB_MID'); bb_l=_v('BB_LOWER')
+        macd_dif=_v('MACD_DIF'); macd_dif_p=_v2('MACD_DIF')
+        macd_line=_v('MACD_LINE'); macd_line_p=_v2('MACD_LINE')
+        macd_hist=_v('MACD_HIST'); macd_hist_p=_v2('MACD_HIST')
+        kd_k=_v('KD_K'); kd_d=_v('KD_D'); kd_k_p=_v2('KD_K'); kd_d_p=_v2('KD_D')
+        kd_golden = bool(d['KD_GOLDEN'].tail(5).any()) if 'KD_GOLDEN' in d.columns else False
+        kd_dead   = bool(d['KD_DEAD'].tail(5).any())   if 'KD_DEAD'   in d.columns else False
+        rsi_val = _v(rsi_col)
+        vol_today = float(d['volume'].iloc[-1]) if 'volume' in d.columns else 0
+        vol_prev  = float(d['volume'].iloc[-2]) if 'volume' in d.columns and len(d)>=2 else 0
+        vol_5avg  = float(d['volume'].tail(5).mean())  if 'volume' in d.columns else 1
+        vol_20avg = float(d['volume'].tail(20).mean()) if 'volume' in d.columns else 1
+        month_high = float(d['high'].tail(60).max()) if 'high' in d.columns else close
+        month_low  = float(d['low'].tail(60).min())  if 'low'  in d.columns else close
+
+        # ── 週線 ──
+        w_close=w_ma20=w_ma60=w_ma5=w_ma10=None
+        w_macd_dif=w_macd_dif_p=w_macd_line=w_macd_line_p=w_macd_hist=w_macd_hist_p=None
+        w_kd_k=w_kd_d=w_kd_k_p=w_kd_d_p=None
+        w_vol=w_vol_prev=None
+        w_recent3 = "(週線數據不可用)"
         if weekly_df is not None and len(weekly_df) >= 2:
-            wl = weekly_df.iloc[-1]
-            w_macd_dif  = float(wl['MACD_DIF'])  if 'MACD_DIF'  in weekly_df.columns else None
-            w_macd_line = float(wl['MACD_LINE'])  if 'MACD_LINE' in weekly_df.columns else None
-            w_ma20      = float(wl['MA20'])        if 'MA20'       in weekly_df.columns else None
-            w_close     = float(wl['close'])
+            def _wv(col):  return float(weekly_df[col].iloc[-1])  if col in weekly_df.columns else None
+            def _wv2(col): return float(weekly_df[col].iloc[-2])  if col in weekly_df.columns else None
+            w_close=_wv('close'); w_ma5=_wv('MA5'); w_ma10=_wv('MA10')
+            w_ma20=_wv('MA20'); w_ma60=_wv('MA60')
+            w_macd_dif=_wv('MACD_DIF'); w_macd_dif_p=_wv2('MACD_DIF')
+            w_macd_line=_wv('MACD_LINE'); w_macd_line_p=_wv2('MACD_LINE')
+            w_macd_hist=_wv('MACD_HIST'); w_macd_hist_p=_wv2('MACD_HIST')
+            w_kd_k=_wv('KD_K'); w_kd_d=_wv('KD_D'); w_kd_k_p=_wv2('KD_K'); w_kd_d_p=_wv2('KD_D')
+            w_vol=_wv('volume'); w_vol_prev=_wv2('volume')
+            wr3 = weekly_df.tail(3)[['date','open','high','low','close','volume']].copy()
+            wr3['date'] = pd.to_datetime(wr3['date']).dt.strftime('%Y-%m-%d')
+            w_recent3 = wr3.to_string(index=False)
 
-        # 融資融券
-        mg_ratio = None; mg_margin = None; mg_short = None
-        if margin_df is not None and len(margin_df) > 0:
-            ml = margin_df.iloc[-1]
-            for col in ['MarginPurchaseRemainingVolume', 'margin_purchase_remaining', 'MarginPurchase']:
-                if col in margin_df.columns:
-                    mg_margin = float(ml[col]); break
-            for col in ['ShortSaleRemainingVolume', 'short_sale_remaining', 'ShortSale']:
-                if col in margin_df.columns:
-                    mg_short  = float(ml[col]); break
-            for col in ['MarginPurchaseRatio', 'margin_ratio']:
-                if col in margin_df.columns:
-                    mg_ratio  = float(ml[col]); break
+        # ── 融資融券 ──
+        mg_rem=mg_chg=mg_buy=mg_sell=None
+        ss_rem=ss_chg=ss_buy=ss_sell=mg_ratio=None
+        if margin_df is not None and len(margin_df) >= 2:
+            def _mg(cols):
+                for c in cols:
+                    if c in margin_df.columns: return float(margin_df[c].iloc[-1])
+                return None
+            def _mg2(cols):
+                for c in cols:
+                    if c in margin_df.columns: return float(margin_df[c].iloc[-2])
+                return None
+            REM_COLS = ['MarginPurchaseRemaining','MarginPurchaseTodayBalance','margin_purchase_remaining']
+            SS_COLS  = ['ShortSaleRemaining','ShortSaleTodayBalance','short_sale_remaining']
+            mg_rem = _mg(REM_COLS); mg_rem2 = _mg2(REM_COLS)
+            mg_buy = _mg(['MarginPurchaseBuy','marginpurchasebuy'])
+            mg_sell= _mg(['MarginPurchaseSell','marginpurchasesell'])
+            ss_rem = _mg(SS_COLS);  ss_rem2 = _mg2(SS_COLS)
+            ss_buy = _mg(['ShortSaleBuy','shortsalebuy'])
+            ss_sell= _mg(['ShortSaleSell','shortsalesell'])
+            for c in ['MarginPurchaseRatio','margin_ratio']:
+                if c in margin_df.columns:
+                    mg_ratio = float(margin_df[c].iloc[-1]); break
+            if mg_rem is not None and mg_rem2 is not None: mg_chg = mg_rem - mg_rem2
+            if ss_rem is not None and ss_rem2 is not None: ss_chg = ss_rem - ss_rem2
 
-        # 三大法人近10日加總
-        inst_summary = ""
+        # ── 三大法人 ──
+        inst_lines = []
         if institutional_df is not None and len(institutional_df) > 0:
             try:
-                inst_tail = institutional_df.tail(10)
-                for col in ['Foreign_Investor', 'ForeignInvestor', 'foreign']:
-                    if col in inst_tail.columns:
-                        inst_summary += f"外資10日:{inst_tail[col].sum():.0f}張 "
-                        break
-                for col in ['Investment_Trust', 'InvestmentTrust', 'investment_trust']:
-                    if col in inst_tail.columns:
-                        inst_summary += f"投信10日:{inst_tail[col].sum():.0f}張 "
-                        break
-                for col in ['Dealer_self', 'DealerSelf', 'dealer']:
-                    if col in inst_tail.columns:
-                        inst_summary += f"自營10日:{inst_tail[col].sum():.0f}張 "
-                        break
+                it = institutional_df.tail(20)
+                for kws, label in [
+                    (['外資','Foreign','foreign'],'外資'),
+                    (['投信','Investment_Trust','Investment Trust'],'投信'),
+                    (['自營','Dealer','dealer'],'自營'),
+                ]:
+                    sub = None
+                    if 'name' in it.columns:
+                        for kw in kws:
+                            mask = it['name'].astype(str).str.contains(kw, na=False)
+                            if mask.any(): sub = it[mask]; break
+                    if sub is not None and 'net' in sub.columns:
+                        net_sum   = int(sub['net'].sum())
+                        net_today = int(sub['net'].iloc[-1])
+                        inst_lines.append(f"{label}：今日{'+' if net_today>=0 else ''}{net_today}張，近20日累計{'+' if net_sum>=0 else ''}{net_sum}張")
             except Exception:
                 pass
 
-        # 組裝 prompt 摘要
-        lines = [
-            f"股票代碼：{symbol}（{market_desc}）",
-            f"最新收盤：{currency}{close:.2f}",
-        ]
-        if rsi_val:  lines.append(f"RSI({rsi_period})：{rsi_val:.2f}")
-        if ma5:      lines.append(f"MA5={ma5:.2f}  MA10={ma10:.2f}  MA20={ma20:.2f}  MA60={ma60:.2f}")
-        if bb_u:     lines.append(f"布林上軌={bb_u:.2f}  中軌={bb_m:.2f}  下軌={bb_l:.2f}")
-        if macd_dif: lines.append(f"日MACD DIF={macd_dif:.4f}  SIGNAL={macd_line:.4f}  HIST={macd_hist:.4f}")
-        if adx_val:  lines.append(f"ADX={adx_val:.2f}")
-        if vol_today and vol_20avg:
-            lines.append(f"今日量={vol_today:.0f}  5日均量={vol_5avg:.0f}  20日均量={vol_20avg:.0f}")
-        if w_macd_dif:
-            lines.append(f"週MACD DIF={w_macd_dif:.4f}  SIGNAL={w_macd_line:.4f}")
-        if w_ma20 and w_close:
-            lines.append(f"週收盤={w_close:.2f}  週MA20={w_ma20:.2f}")
-        if mg_margin:
-            lines.append(f"融資餘額={mg_margin:.0f}  融券餘額={mg_short:.0f}  融資比={mg_ratio}")
-        if inst_summary:
-            lines.append(f"三大法人：{inst_summary}")
-        if bull_signals:
-            lines.append(f"多頭訊號評分：{bull_signals['total_score']:.0f}/100 — {bull_signals['conclusion']}")
+        zhu_str  = ""
         if zhu_result:
-            lines.append(f"朱家泓趨勢評分：{zhu_result['score']}/100 — {zhu_result['action_label']} — 趨勢:{zhu_result['trend']}")
+            zhu_str = f"朱家泓評分：{zhu_result['score']}/100（{zhu_result['action_label']}），趨勢：{zhu_result['trend']}"
+            if zhu_result.get('transition'): zhu_str += f"，{zhu_result['transition']}"
+        bull_str = f"多頭訊號：{bull_signals['total_score']:.0f}/100 — {bull_signals['conclusion']}" if bull_signals else ""
 
-        data_summary = "\n".join(lines)
+        # ── 輔助函式：安全格式化 ──
+        def _f(v, fmt=".2f"): return format(v, fmt) if v is not None else "N/A"
+        def _chg_str(chg): return (("增加" if chg>0 else "減少") + str(abs(int(chg))) + "張") if chg is not None else ""
 
-        system_msg = """你是台灣資深股票技術分析師，熟悉朱家泓多空操作秘笈分析框架。
-根據提供的技術指標數據，填入選股評量表格的各個欄位。
-請以 JSON 格式回傳，不加任何 markdown 符號或前綴文字，直接輸出 JSON 物件。
-欄位定義如下：
-- 波型描述：以「↑上升波」「↓下降波」「→震盪整理」描述月/週/日K線形態
-- 位置：以「底部」「中段」「頂部」「頸線附近」描述週/日線所在波段位置
-- K線型態：描述最近1-2根K線的形態（如：長紅實體、下影線、吞噬、十字星等）
-- 均線描述：以「多頭排列」「空頭排列」「糾結」「扣抵向上/下」描述
-- 切線描述：以「上升切線」「下降切線」「水平整理」描述趨勢線方向
-- 成交量描述：以「放量」「縮量」「量增價漲」「量縮整理」「爆量出貨」等描述
-- 指標描述：MACD以「金叉」「死叉」「柱縮」「柱增」「零軸上下」描述；KD以「金叉」「死叉」「高檔鈍化」「低檔鈍化」描述
-- 支撐/壓力：給出具體價位數值
-- 背離：「頂背離」「底背離」「無明顯背離」
-- 融資融券：描述增減趨勢
-- 法人買賣超：描述多空傾向
-- 型態：識別技術型態（W底/頭肩底/旗形/三角收斂/突破/上升通道等）
-- 策略：給出具體操作策略建議（含進出場條件）
-"""
+        # ── 組裝數值摘要文字 ──
+        lines_list = [
+            f"【股票代碼】{symbol}（{market_desc}）　收盤：{currency}{_f(close)}",
+            "",
+            "【近5日K線】",
+            recent5_str,
+            "",
+            "【日線均線】",
+            f"MA5={_f(ma5)}（前{_f(ma5p)}）  MA10={_f(ma10)}（前{_f(ma10p)}）  MA20={_f(ma20)}（前{_f(ma20p)}）  MA60={_f(ma60)}（前{_f(ma60p)}）",
+            f"布林上軌={_f(bb_u)}  中軌={_f(bb_m)}  下軌={_f(bb_l)}",
+            f"收盤位置：{'高於' if ma5 and close>ma5 else '低於'}MA5  {'高於' if ma20 and close>ma20 else '低於'}MA20  {'高於' if ma60 and close>ma60 else '低於'}MA60",
+            "",
+            "【日線成交量】",
+            f"今日={int(vol_today)}　前日={int(vol_prev)}　5日均={int(vol_5avg)}　20日均={int(vol_20avg)}　量比={vol_today/vol_20avg:.2f}倍",
+            "",
+            "【日線MACD(12,26,9)】",
+            f"DIF={_f(macd_dif,'.4f')}（前{_f(macd_dif_p,'.4f')}）  SIGNAL={_f(macd_line,'.4f')}（前{_f(macd_line_p,'.4f')}）  HIST={_f(macd_hist,'.4f')}（前{_f(macd_hist_p,'.4f')}）",
+            f"DIF在零軸{'上方' if macd_dif and macd_dif>0 else '下方'}　HIST{'擴大' if macd_hist and macd_hist_p and abs(macd_hist)>abs(macd_hist_p) else '縮小'}中",
+            "",
+            "【日線KD(9)】",
+            f"K={_f(kd_k,'.1f')}（前{_f(kd_k_p,'.1f')}）  D={_f(kd_d,'.1f')}（前{_f(kd_d_p,'.1f')}）" +
+            (" ⭐近5日KD金叉" if kd_golden else "") + (" ⚠️近5日KD死叉" if kd_dead else "") +
+            (" 【高檔鈍化K>80】" if kd_k and kd_k>80 else " 【低檔鈍化K<20】" if kd_k and kd_k<20 else ""),
+            f"RSI({rsi_period})={_f(rsi_val,'.2f')}",
+            "",
+            "【近3週K線】",
+            w_recent3,
+            "",
+            "【週線均線】",
+            f"週收={_f(w_close)}  週MA5={_f(w_ma5)}  週MA10={_f(w_ma10)}  週MA20={_f(w_ma20)}  週MA60={_f(w_ma60)}",
+            f"週收 vs 週均：{'高於' if w_close and w_ma20 and w_close>w_ma20 else '低於'}週MA20  {'高於' if w_close and w_ma60 and w_close>w_ma60 else '低於'}週MA60",
+            "",
+            "【週線MACD】",
+            f"DIF={_f(w_macd_dif,'.4f')}（前{_f(w_macd_dif_p,'.4f')}）  SIGNAL={_f(w_macd_line,'.4f')}（前{_f(w_macd_line_p,'.4f')}）  HIST={_f(w_macd_hist,'.4f')}",
+            "",
+            "【週線KD】",
+            f"K={_f(w_kd_k,'.1f')}（前{_f(w_kd_k_p,'.1f')}）  D={_f(w_kd_d,'.1f')}（前{_f(w_kd_d_p,'.1f')}）",
+            "",
+            f"【近60日高低】最高={_f(month_high)}　最低={_f(month_low)}",
+        ]
 
-        user_msg = f"""根據以下技術指標數據，填入朱家泓選股評量表所有欄位，以 JSON 輸出：
+        if mg_rem is not None:
+            lines_list += [
+                "",
+                "【融資融券（台股）】",
+                f"融資餘額={int(mg_rem)}張（{_chg_str(mg_chg)}）　融資買進={int(mg_buy) if mg_buy else 'N/A'}張　融資賣出={int(mg_sell) if mg_sell else 'N/A'}張",
+                f"融券餘額={int(ss_rem) if ss_rem else 'N/A'}張（{_chg_str(ss_chg)}）　融券賣出={int(ss_sell) if ss_sell else 'N/A'}張　融券回補={int(ss_buy) if ss_buy else 'N/A'}張",
+                f"融資比率={_f(mg_ratio,'.2f') if mg_ratio else 'N/A'}%",
+            ]
+        if inst_lines:
+            lines_list += ["", "【三大法人（台股）】"] + inst_lines
+        if zhu_str:  lines_list += ["", zhu_str]
+        if bull_str: lines_list.append(bull_str)
 
-{data_summary}
+        data_block = "\n".join(lines_list)
 
-請輸出以下 JSON 結構（所有值為字串，具體簡潔，不超過30字）：
-{{
-  "波型_月線": "",
-  "波型_週線": "",
-  "波型_日線": "",
-  "位置_週線": "",
-  "位置_日線": "",
-  "K線_週": "",
-  "K線_日": "",
-  "均線_週": "",
-  "均線_日": "",
-  "切線": "",
-  "成交量_週": "",
-  "成交量_日": "",
-  "指標_週MACD": "",
-  "指標_週KD": "",
-  "指標_日MACD": "",
-  "指標_日KD": "",
-  "支撐_週": "",
-  "支撐_日": "",
-  "壓力_週": "",
-  "壓力_日": "",
-  "背離": "",
-  "融資": "",
-  "融券": "",
-  "融資比": "",
-  "法人買賣超": "",
-  "型態": "",
-  "其他": "",
-  "策略": ""
-}}
-"""
+        example_block = (
+            "\n【填寫範例參考（安國8054，2023/9/15）】\n"
+            "波型_月線=底部橫盤\n"
+            "波型_週線=底底高、突破MA20、MA60\n"
+            "波型_日線=多頭確認、突破MA20、MA60\n"
+            "位置_週線=多頭回後上漲\n"
+            "位置_日線=多頭確認，週前高盤整壓力\n"
+            "K線_週=大量長紅K突破MA20、MA60\n"
+            "K線_日=大量長紅K，收盤站上季線(MA60)\n"
+            "均線_週=週MA20向上，股價站上週MA20\n"
+            "均線_日=日均線4線多排向上，可中長線操作\n"
+            "切線=切線多頭向上\n"
+            "成交量_週=週量比前一週大3倍\n"
+            "成交量_日=日線出大量\n"
+            "指標_週MACD=週MACD在0軸之上向上，黃金交叉，紅柱\n"
+            "指標_週KD=K59 > D40 多排向上\n"
+            "指標_日MACD=日MACD在0軸之上向上，紅柱延長\n"
+            "指標_日KD=K69 > D60 多排向上\n"
+            "支撐_週=大量長紅低點37.45元；MA60為33.87元；MA20為33元\n"
+            "支撐_日=大量長紅低點37.45元；MA20為33元\n"
+            "壓力_週=38.3元、43元、48.55元、67.8元\n"
+            "壓力_日=38.3元、43元、48.55元\n"
+            "背離=無\n"
+            "融資=增加589張，餘額4950張\n"
+            "融券=增加95張，餘額144張\n"
+            "融資比=2.91%\n"
+            "法人買賣超=外資：連3天買超，今買135張\n"
+            "型態=圓弧底多頭型態\n"
+            "其他=今日爆大量長紅，明日遇壓容易震盪\n"
+            "策略=1.明日遇壓，待突破壓力38.3元（週線多頭確認），開始做多。2.資金分配20張，10張短線守MA5操作，10張長線守MA20操作。\n"
+        )
+
+        system_msg = (
+            "你是台灣資深股票技術分析師，精通朱家泓《多空操作秘笈》技術分析體系。\n"
+            "任務：根據提供的完整數值數據，仿照範例填入選股評量表格每個欄位。\n"
+            "要求：\n"
+            "1. 所有欄位必須引用具體數值（價位到小數點、張數、KD值、倍數等），不可空洞\n"
+            "2. 波型描述要判斷底部/中段/頂部的位置，以及是否突破均線\n"
+            "3. 支撐/壓力必須給出具體價位（參考MA線、近期高低點、布林通道）\n"
+            "4. 融資融券欄位必須包含「增加/減少X張，餘額X張」格式\n"
+            "5. 策略欄位需包含：具體進出場條件（含突破哪條均線）、資金管理建議\n"
+            "6. 以繁體中文輸出，直接輸出 JSON，不加 markdown 符號"
+        )
+
+        user_msg = (
+            data_block + "\n\n" + example_block +
+            "\n請仿照上方範例格式（具體數值、張數、價位），填入以下 JSON 結構，所有值為字串：\n"
+            '{\n'
+            '  "波型_月線": "",\n'
+            '  "波型_週線": "",\n'
+            '  "波型_日線": "",\n'
+            '  "位置_週線": "",\n'
+            '  "位置_日線": "",\n'
+            '  "K線_週": "",\n'
+            '  "K線_日": "",\n'
+            '  "均線_週": "",\n'
+            '  "均線_日": "",\n'
+            '  "切線": "",\n'
+            '  "成交量_週": "",\n'
+            '  "成交量_日": "",\n'
+            '  "指標_週MACD": "",\n'
+            '  "指標_週KD": "",\n'
+            '  "指標_日MACD": "",\n'
+            '  "指標_日KD": "",\n'
+            '  "支撐_週": "",\n'
+            '  "支撐_日": "",\n'
+            '  "壓力_週": "",\n'
+            '  "壓力_日": "",\n'
+            '  "背離": "",\n'
+            '  "融資": "",\n'
+            '  "融券": "",\n'
+            '  "融資比": "",\n'
+            '  "法人買賣超": "",\n'
+            '  "型態": "",\n'
+            '  "其他": "",\n'
+            '  "策略": ""\n'
+            '}'
+        )
 
         response = client.chat.completions.create(
-            model="gpt-4o-mini",
+            model="gpt-4o",
             messages=[
                 {"role": "system", "content": system_msg},
                 {"role": "user",   "content": user_msg},
             ],
-            max_tokens=900,
-            temperature=0.3
+            max_tokens=1500,
+            temperature=0.2
         )
         raw = response.choices[0].message.content.strip()
-        # 清除可能的 markdown 包裹
         raw = raw.replace("```json", "").replace("```", "").strip()
         return json.loads(raw)
 
@@ -3735,6 +3829,57 @@ def generate_investment_advice(symbol, stock_data, openai_api_key, market='us', 
         if ma60: summary_lines.append(f"MA60：{ma60:.2f}")
         if bb_upper and bb_lower:
             summary_lines.append(f"布林上軌：{bb_upper:.2f}  布林下軌：{bb_lower:.2f}")
+
+        # ── 線型辨識輔助數值（朱家泓圖案判斷用）──
+        try:
+            _d = stock_data
+            _close  = float(_d['close'].iloc[-1])
+            _vol    = float(_d['volume'].iloc[-1])   if 'volume' in _d.columns else 0
+            _vol20  = float(_d['volume'].tail(20).mean()) if 'volume' in _d.columns else 1
+            _vol_ratio = round(_vol / _vol20, 2) if _vol20 > 0 else 0
+            _ma5    = float(_d['MA5'].iloc[-1])  if 'MA5'  in _d.columns else None
+            _ma20   = float(_d['MA20'].iloc[-1]) if 'MA20' in _d.columns else None
+            _ma60   = float(_d['MA60'].iloc[-1]) if 'MA60' in _d.columns else None
+            _kd_k   = float(_d['KD_K'].iloc[-1]) if 'KD_K' in _d.columns else None
+            _kd_d   = float(_d['KD_D'].iloc[-1]) if 'KD_D' in _d.columns else None
+            _kd_golden = bool(_d['KD_GOLDEN'].tail(5).any()) if 'KD_GOLDEN' in _d.columns else False
+            _kd_dead   = bool(_d['KD_DEAD'].tail(5).any())   if 'KD_DEAD'   in _d.columns else False
+            _macd_dif  = float(_d['MACD_DIF'].iloc[-1])  if 'MACD_DIF'  in _d.columns else None
+            _macd_hist = float(_d['MACD_HIST'].iloc[-1]) if 'MACD_HIST' in _d.columns else None
+            _macd_hist_p = float(_d['MACD_HIST'].iloc[-2]) if 'MACD_HIST' in _d.columns and len(_d)>=2 else None
+            _hi_today = float(_d['high'].iloc[-1]) if 'high' in _d.columns else _close
+            _lo_today = float(_d['low'].iloc[-1])  if 'low'  in _d.columns else _close
+            _body_ratio = abs(_close - float(_d['open'].iloc[-1])) / (_hi_today - _lo_today + 0.001)
+            _upper_shadow = (_hi_today - max(_close, float(_d['open'].iloc[-1]))) / (_hi_today - _lo_today + 0.001)
+            _prev_hi5 = float(_d['high'].tail(5).iloc[:-1].max()) if 'high' in _d.columns else _close
+            _min60  = float(_d['low'].tail(60).min())  if 'low'  in _d.columns else _close
+            _max60  = float(_d['high'].tail(60).max()) if 'high' in _d.columns else _close
+
+            pattern_data = {
+                "收盤": round(_close, 2),
+                "今日量/20日均量倍數": _vol_ratio,
+                "今日實體比例(0~1)": round(_body_ratio, 2),
+                "今日上影線比例(0~1)": round(_upper_shadow, 2),
+                "近5日最高點": round(_prev_hi5, 2),
+                "近60日最低": round(_min60, 2),
+                "近60日最高": round(_max60, 2),
+            }
+            if _ma5:  pattern_data["MA5"] = round(_ma5, 2)
+            if _ma20: pattern_data["MA20"] = round(_ma20, 2)
+            if _ma60: pattern_data["MA60"] = round(_ma60, 2)
+            if _kd_k: pattern_data["KD_K"] = round(_kd_k, 1)
+            if _kd_d: pattern_data["KD_D"] = round(_kd_d, 1)
+            pattern_data["KD近5日金叉"] = _kd_golden
+            pattern_data["KD近5日死叉"] = _kd_dead
+            if _macd_dif:  pattern_data["MACD_DIF"] = round(_macd_dif, 4)
+            if _macd_hist: pattern_data["MACD_HIST"] = round(_macd_hist, 4)
+            if _macd_hist_p: pattern_data["MACD_HIST前日"] = round(_macd_hist_p, 4)
+            pattern_data["收盤高於MA5"]  = bool(_ma5  and _close > _ma5)
+            pattern_data["收盤高於MA20"] = bool(_ma20 and _close > _ma20)
+            pattern_data["收盤高於MA60"] = bool(_ma60 and _close > _ma60)
+            user_prompt += f"\n### 朱家泓線型辨識輔助數值\n{json.dumps(pattern_data, ensure_ascii=False)}\n"
+        except Exception:
+            pass
 
         # 多頭訊號
         if bull_signals:
@@ -4018,6 +4163,57 @@ def generate_ai_insights(symbol, stock_data, openai_api_key, start_date, end_dat
         except Exception:
             pass
 
+        # ── 線型辨識輔助數值（朱家泓圖案判斷用）──
+        try:
+            _d = stock_data
+            _close  = float(_d['close'].iloc[-1])
+            _vol    = float(_d['volume'].iloc[-1])   if 'volume' in _d.columns else 0
+            _vol20  = float(_d['volume'].tail(20).mean()) if 'volume' in _d.columns else 1
+            _vol_ratio = round(_vol / _vol20, 2) if _vol20 > 0 else 0
+            _ma5    = float(_d['MA5'].iloc[-1])  if 'MA5'  in _d.columns else None
+            _ma20   = float(_d['MA20'].iloc[-1]) if 'MA20' in _d.columns else None
+            _ma60   = float(_d['MA60'].iloc[-1]) if 'MA60' in _d.columns else None
+            _kd_k   = float(_d['KD_K'].iloc[-1]) if 'KD_K' in _d.columns else None
+            _kd_d   = float(_d['KD_D'].iloc[-1]) if 'KD_D' in _d.columns else None
+            _kd_golden = bool(_d['KD_GOLDEN'].tail(5).any()) if 'KD_GOLDEN' in _d.columns else False
+            _kd_dead   = bool(_d['KD_DEAD'].tail(5).any())   if 'KD_DEAD'   in _d.columns else False
+            _macd_dif  = float(_d['MACD_DIF'].iloc[-1])  if 'MACD_DIF'  in _d.columns else None
+            _macd_hist = float(_d['MACD_HIST'].iloc[-1]) if 'MACD_HIST' in _d.columns else None
+            _macd_hist_p = float(_d['MACD_HIST'].iloc[-2]) if 'MACD_HIST' in _d.columns and len(_d)>=2 else None
+            _hi_today = float(_d['high'].iloc[-1]) if 'high' in _d.columns else _close
+            _lo_today = float(_d['low'].iloc[-1])  if 'low'  in _d.columns else _close
+            _body_ratio = abs(_close - float(_d['open'].iloc[-1])) / (_hi_today - _lo_today + 0.001)
+            _upper_shadow = (_hi_today - max(_close, float(_d['open'].iloc[-1]))) / (_hi_today - _lo_today + 0.001)
+            _prev_hi5 = float(_d['high'].tail(5).iloc[:-1].max()) if 'high' in _d.columns else _close
+            _min60  = float(_d['low'].tail(60).min())  if 'low'  in _d.columns else _close
+            _max60  = float(_d['high'].tail(60).max()) if 'high' in _d.columns else _close
+
+            pattern_data = {
+                "收盤": round(_close, 2),
+                "今日量/20日均量倍數": _vol_ratio,
+                "今日實體比例(0~1)": round(_body_ratio, 2),
+                "今日上影線比例(0~1)": round(_upper_shadow, 2),
+                "近5日最高點": round(_prev_hi5, 2),
+                "近60日最低": round(_min60, 2),
+                "近60日最高": round(_max60, 2),
+            }
+            if _ma5:  pattern_data["MA5"] = round(_ma5, 2)
+            if _ma20: pattern_data["MA20"] = round(_ma20, 2)
+            if _ma60: pattern_data["MA60"] = round(_ma60, 2)
+            if _kd_k: pattern_data["KD_K"] = round(_kd_k, 1)
+            if _kd_d: pattern_data["KD_D"] = round(_kd_d, 1)
+            pattern_data["KD近5日金叉"] = _kd_golden
+            pattern_data["KD近5日死叉"] = _kd_dead
+            if _macd_dif:  pattern_data["MACD_DIF"] = round(_macd_dif, 4)
+            if _macd_hist: pattern_data["MACD_HIST"] = round(_macd_hist, 4)
+            if _macd_hist_p: pattern_data["MACD_HIST前日"] = round(_macd_hist_p, 4)
+            pattern_data["收盤高於MA5"]  = bool(_ma5  and _close > _ma5)
+            pattern_data["收盤高於MA20"] = bool(_ma20 and _close > _ma20)
+            pattern_data["收盤高於MA60"] = bool(_ma60 and _close > _ma60)
+            user_prompt += f"\n### 朱家泓線型辨識輔助數值\n{json.dumps(pattern_data, ensure_ascii=False)}\n"
+        except Exception:
+            pass
+
         # 多頭訊號
         if bull_signals:
             signal_summary = "\n".join([
@@ -4105,6 +4301,51 @@ def generate_ai_insights(symbol, stock_data, openai_api_key, start_date, end_dat
 #### 17. 市場觀察
 - 短期技術面觀察（1-2週）、中期技術面觀察（1-3個月）
 
+
+#### 8c. 技術線型圖案辨識（必要）
+依據朱家泓《多空操作秘笈》第12章33種贏家圖像，根據K線、成交量、均線、切線數據，判斷目前最符合哪種線型圖案並說明訊號意涵：
+
+【多轉空警示圖案（出現→減碼/停利/做空）】
+1. 高檔大量長黑一日反轉：高檔爆大量長黑K，收盤站不住，次日跌破長黑低點
+2. 大量長黑破切線反轉：大量長黑K跌破長期上升切線（含MA20），頭頭低確認
+3. 大量雙頭反轉：兩個高點形成頭頭低，爆量後跌破底部（空頭確認）
+4. 遇壓爆量黑K快跑：股價觸碰歷史壓力區，爆大量出現黑K，隔日出現一日反轉
+5. 高檔連2日大量黑K跌破：連續兩日大量黑K，第二日跌破前日低點，空頭確認
+6. 高檔大量長上影線反轉：爆大量但收盤弱，留長上影線，頭頭低後空頭確認
+7. 高檔跳空黑K回檔反轉：跳空開低形成跳空黑K，出現頭頭低，爆量空頭確認
+8. 連3天上漲長上影線出貨：連續三天大量長上影線碰壓力，大敵當前，頭頭低
+9. MACD頂背離：價格創新高但MACD未創新高，背離警示
+10. KD高檔死叉：KD在80以上出現死叉，高檔鈍化後轉弱
+11. 跌破2日大量低點停利：出現爆量後次日跌破2日大量低點，多單停利
+12. 量縮價跌均線反壓：成交量萎縮，股價跌破均線，均線由上往下壓制
+13. 頸線跌破做空：W頂頸線或雙頭底部跌破，確認空頭
+14. 島型反轉（高檔）：高檔出現跳空缺口後又跳空缺口回，形成島型頂部
+15. ABC突破後長黑下跌：突破下降切線後拉高，再出現大量長黑K空頭確認
+
+【空轉多做多圖案（出現→積極布局/買進）】
+1. 圓弧底多頭突破：底部圓弧形成，均線糾結向上，大量長紅突破前高
+2. W底大量紅K突破：雙底型態，第二底不破前低，大量長紅突破頸線買進
+3. 頭肩底大量突破：左肩、頭、右肩形成，大量長紅突破頸線
+4. 底部放量長紅突破前高：底部大量長紅K突破前高，多頭確認
+5. 底部洗盤上攻大漲：底部爆大量長黑後次日大量長紅（破底洗盤），突破前高
+6. 過空高大漲：空轉多後突破前波高點，均線多排，強勢上漲
+7. 空轉多過空高大漲：底部突破均線後，攻過空頭高點，均線翻多
+8. 均線糾結大量紅K突破：均線糾結壓縮後，大量長紅突破，起漲訊號
+9. 突破ABC上漲：底部打底後以ABC修正型態突破下降切線，大量長紅買進
+10. 島型反轉（低檔）：低檔出現向下跳空缺口後又向上跳空缺口，形成島型底
+11. 突破上升軌道線大漲：股價突破上升軌道線上緣，大量長紅，加速上漲
+12. 雙弧底大量紅K突破：兩個圓弧底型態，均線糾結後大量紅K突破
+13. 底底高大量長紅：底部一底高於一底，大量長紅突破前波高點
+14. 低檔縮量後放量長紅：底部縮量整理後突然放大量長紅，起漲訊號
+15. 多頭拉回不破MA20再上攻：上漲後拉回測試MA20，縮量後再度放量上攻
+
+根據當前的K線型態、成交量（今日/20日均量比）、MACD趨勢、KD位置、均線排列，
+判斷目前最符合上述哪一種或哪幾種圖案（可複選），並說明：
+- 符合圖案名稱與編號
+- 判斷依據（引用具體數值，如量比、突破均線、KD數值等）
+- 後續觀察重點與操作含意
+若無明顯符合圖案，說明目前在「醞釀期」並描述需要觀察的條件
+
 #### 18. 結論（股價位階 / 多頭訊號強弱 / 中長線勝率）
 {conclusion_extra}
 
@@ -4172,6 +4413,51 @@ def generate_ai_insights(symbol, stock_data, openai_api_key, start_date, end_dat
 
 #### 15. 市場觀察
 - 短期技術面觀察（1-2週）、中期技術面觀察（1-3個月）
+
+
+#### 8c. 技術線型圖案辨識（必要）
+依據朱家泓《多空操作秘笈》第12章33種贏家圖像，根據K線、成交量、均線、切線數據，判斷目前最符合哪種線型圖案並說明訊號意涵：
+
+【多轉空警示圖案（出現→減碼/停利/做空）】
+1. 高檔大量長黑一日反轉：高檔爆大量長黑K，收盤站不住，次日跌破長黑低點
+2. 大量長黑破切線反轉：大量長黑K跌破長期上升切線（含MA20），頭頭低確認
+3. 大量雙頭反轉：兩個高點形成頭頭低，爆量後跌破底部（空頭確認）
+4. 遇壓爆量黑K快跑：股價觸碰歷史壓力區，爆大量出現黑K，隔日出現一日反轉
+5. 高檔連2日大量黑K跌破：連續兩日大量黑K，第二日跌破前日低點，空頭確認
+6. 高檔大量長上影線反轉：爆大量但收盤弱，留長上影線，頭頭低後空頭確認
+7. 高檔跳空黑K回檔反轉：跳空開低形成跳空黑K，出現頭頭低，爆量空頭確認
+8. 連3天上漲長上影線出貨：連續三天大量長上影線碰壓力，大敵當前，頭頭低
+9. MACD頂背離：價格創新高但MACD未創新高，背離警示
+10. KD高檔死叉：KD在80以上出現死叉，高檔鈍化後轉弱
+11. 跌破2日大量低點停利：出現爆量後次日跌破2日大量低點，多單停利
+12. 量縮價跌均線反壓：成交量萎縮，股價跌破均線，均線由上往下壓制
+13. 頸線跌破做空：W頂頸線或雙頭底部跌破，確認空頭
+14. 島型反轉（高檔）：高檔出現跳空缺口後又跳空缺口回，形成島型頂部
+15. ABC突破後長黑下跌：突破下降切線後拉高，再出現大量長黑K空頭確認
+
+【空轉多做多圖案（出現→積極布局/買進）】
+1. 圓弧底多頭突破：底部圓弧形成，均線糾結向上，大量長紅突破前高
+2. W底大量紅K突破：雙底型態，第二底不破前低，大量長紅突破頸線買進
+3. 頭肩底大量突破：左肩、頭、右肩形成，大量長紅突破頸線
+4. 底部放量長紅突破前高：底部大量長紅K突破前高，多頭確認
+5. 底部洗盤上攻大漲：底部爆大量長黑後次日大量長紅（破底洗盤），突破前高
+6. 過空高大漲：空轉多後突破前波高點，均線多排，強勢上漲
+7. 空轉多過空高大漲：底部突破均線後，攻過空頭高點，均線翻多
+8. 均線糾結大量紅K突破：均線糾結壓縮後，大量長紅突破，起漲訊號
+9. 突破ABC上漲：底部打底後以ABC修正型態突破下降切線，大量長紅買進
+10. 島型反轉（低檔）：低檔出現向下跳空缺口後又向上跳空缺口，形成島型底
+11. 突破上升軌道線大漲：股價突破上升軌道線上緣，大量長紅，加速上漲
+12. 雙弧底大量紅K突破：兩個圓弧底型態，均線糾結後大量紅K突破
+13. 底底高大量長紅：底部一底高於一底，大量長紅突破前波高點
+14. 低檔縮量後放量長紅：底部縮量整理後突然放大量長紅，起漲訊號
+15. 多頭拉回不破MA20再上攻：上漲後拉回測試MA20，縮量後再度放量上攻
+
+根據當前的K線型態、成交量（今日/20日均量比）、MACD趨勢、KD位置、均線排列，
+判斷目前最符合上述哪一種或哪幾種圖案（可複選），並說明：
+- 符合圖案名稱與編號
+- 判斷依據（引用具體數值，如量比、突破均線、KD數值等）
+- 後續觀察重點與操作含意
+若無明顯符合圖案，說明目前在「醞釀期」並描述需要觀察的條件
 
 #### 16. 結論（股價位階 / 多頭訊號強弱 / 中長線勝率）
 {conclusion_extra}
@@ -5455,38 +5741,38 @@ if analyze_button:
                             label_visibility="collapsed",
                             placeholder="記錄進出場條件、停損停利設定、操作方向（做多/做空/觀望）...")
 
-                        # 儲存按鈕
-                        if st.button("💾 儲存評量記錄", key=f"{_eval_key}_save"):
-                            st.session_state[_eval_key] = {
-                                "日期": str(_eval_date), "營業項目": _eval_biz, "股本": _eval_cap,
-                                "基本面": _eval_fundamental,
-                                "波型_月線": _eval_wave_m, "波型_週線": _eval_wave_w, "波型_日線": _eval_wave_d,
-                                "位置_週線": _eval_pos_w, "位置_日線": _eval_pos_d,
-                                "K線_週": _eval_k_w, "K線_日": _eval_k_d,
-                                "均線_週": _eval_ma_w, "均線_日": _eval_ma_d, "切線": _eval_ma_cut,
-                                "成交量_週": _eval_vol_w, "成交量_日": _eval_vol_d,
-                                "指標_週MACD": _eval_ind_wmacd, "指標_週KD": _eval_ind_wkd,
-                                "指標_日MACD": _eval_ind_dmacd, "指標_日KD": _eval_ind_dkd,
-                                "支撐_週": _eval_sup_w, "支撐_日": _eval_sup_d,
-                                "壓力_週": _eval_res_w, "壓力_日": _eval_res_d,
-                                "背離": _eval_diverge,
-                                "融資": _eval_margin, "融券": _eval_short, "融資比": _eval_mratio,
-                                "法人買賣超": _eval_inst, "型態": _eval_pattern, "其他": _eval_other,
-                                "策略": _eval_strategy,
-                            }
-                            st.success(f"✅ 已儲存 {_eval_symbol} 的評量記錄（本次 session 有效）")
+                        # ── 即時同步所有欄位到 session_state（無需按鈕，不觸發 rerun）──
+                        _eval_snapshot = {
+                            "日期": str(_eval_date), "營業項目": _eval_biz, "股本": _eval_cap,
+                            "基本面": _eval_fundamental,
+                            "波型_月線": _eval_wave_m, "波型_週線": _eval_wave_w, "波型_日線": _eval_wave_d,
+                            "位置_週線": _eval_pos_w, "位置_日線": _eval_pos_d,
+                            "K線_週": _eval_k_w, "K線_日": _eval_k_d,
+                            "均線_週": _eval_ma_w, "均線_日": _eval_ma_d, "切線": _eval_ma_cut,
+                            "成交量_週": _eval_vol_w, "成交量_日": _eval_vol_d,
+                            "指標_週MACD": _eval_ind_wmacd, "指標_週KD": _eval_ind_wkd,
+                            "指標_日MACD": _eval_ind_dmacd, "指標_日KD": _eval_ind_dkd,
+                            "支撐_週": _eval_sup_w, "支撐_日": _eval_sup_d,
+                            "壓力_週": _eval_res_w, "壓力_日": _eval_res_d,
+                            "背離": _eval_diverge,
+                            "融資": _eval_margin, "融券": _eval_short, "融資比": _eval_mratio,
+                            "法人買賣超": _eval_inst, "型態": _eval_pattern, "其他": _eval_other,
+                            "策略": _eval_strategy,
+                        }
+                        # 靜默同步，不觸發 rerun（值已在 widget key 裡，session_state 更新不影響畫面）
+                        st.session_state[_eval_key].update(_eval_snapshot)
 
-                        # 匯出 CSV 按鈕
-                        if st.session_state[_eval_key]:
-                            _eval_df = pd.DataFrame([st.session_state[_eval_key]])
-                            _eval_csv = _eval_df.to_csv(index=False).encode("utf-8-sig")
-                            st.download_button(
-                                "📥 下載評量表 CSV",
-                                _eval_csv,
-                                file_name=f"選股評量_{_eval_symbol}_{datetime.now().strftime('%Y%m%d')}.csv",
-                                mime="text/csv",
-                                key=f"{_eval_key}_download"
-                            )
+                        # ── 下載 CSV（download_button 不觸發 rerun，安全使用）──
+                        st.markdown("---")
+                        _eval_df  = pd.DataFrame([_eval_snapshot])
+                        _eval_csv = _eval_df.to_csv(index=False).encode("utf-8-sig")
+                        st.download_button(
+                            "📥 下載評量表 CSV",
+                            _eval_csv,
+                            file_name=f"選股評量_{_eval_symbol}_{datetime.now().strftime('%Y%m%d')}.csv",
+                            mime="text/csv",
+                            key=f"{_eval_key}_download"
+                        )
 
             else:
                 st.warning("所選日期範圍內沒有交易數據，請調整日期範圍。")
