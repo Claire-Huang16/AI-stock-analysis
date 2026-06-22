@@ -3522,6 +3522,187 @@ def create_oscillator_chart(df, symbol):
         return None
 
 
+def generate_stock_evaluation(symbol, stock_data, openai_api_key, market='us',
+                               zhu_result=None, bull_signals=None, rsi_period=14,
+                               institutional_df=None, margin_df=None,
+                               weekly_df=None, financial_data=None,
+                               analyst_data=None, insider_df=None, director_df=None):
+    """
+    使用 AI 自動填入朱家泓選股評量表格的所有欄位，回傳 dict。
+    欄位對應圖表10-3-1：波型/位置/K線/均線/成交量/指標/支撐/壓力/背離/融資融券/法人/型態/策略
+    """
+    try:
+        client = OpenAI(api_key=openai_api_key)
+        currency    = "NT$" if market == 'tw' else "USD"
+        market_desc = "台股" if market == 'tw' else "美股"
+        rsi_col     = f'RSI{rsi_period}'
+
+        # ── 收集數值摘要 ──
+        d  = stock_data
+        ld = d.iloc[-1]   # latest day
+        close   = float(ld['close'])
+        rsi_val = float(d[rsi_col].iloc[-1]) if rsi_col in d.columns else None
+        ma5     = float(d['MA5'].iloc[-1])  if 'MA5'  in d.columns else None
+        ma10    = float(d['MA10'].iloc[-1]) if 'MA10' in d.columns else None
+        ma20    = float(d['MA20'].iloc[-1]) if 'MA20' in d.columns else None
+        ma60    = float(d['MA60'].iloc[-1]) if 'MA60' in d.columns else None
+        bb_u    = float(d['BB_UPPER'].iloc[-1]) if 'BB_UPPER' in d.columns else None
+        bb_l    = float(d['BB_LOWER'].iloc[-1]) if 'BB_LOWER' in d.columns else None
+        bb_m    = float(d['BB_MID'].iloc[-1])   if 'BB_MID'   in d.columns else None
+        macd_dif  = float(d['MACD_DIF'].iloc[-1])  if 'MACD_DIF'  in d.columns else None
+        macd_line = float(d['MACD_LINE'].iloc[-1]) if 'MACD_LINE' in d.columns else None
+        macd_hist = float(d['MACD_HIST'].iloc[-1]) if 'MACD_HIST' in d.columns else None
+        obv_val   = float(d['OBV'].iloc[-1]) if 'OBV' in d.columns else None
+        adx_val   = float(d['ADX'].iloc[-1]) if 'ADX' in d.columns else None
+        vol_5avg  = float(d['volume'].tail(5).mean())  if 'volume' in d.columns else None
+        vol_20avg = float(d['volume'].tail(20).mean()) if 'volume' in d.columns else None
+        vol_today = float(d['volume'].iloc[-1]) if 'volume' in d.columns else None
+
+        # 週線摘要
+        w_macd_dif  = None; w_macd_line = None; w_kd_k = None; w_kd_d = None
+        w_ma20      = None; w_close     = None
+        if weekly_df is not None and len(weekly_df) >= 2:
+            wl = weekly_df.iloc[-1]
+            w_macd_dif  = float(wl['MACD_DIF'])  if 'MACD_DIF'  in weekly_df.columns else None
+            w_macd_line = float(wl['MACD_LINE'])  if 'MACD_LINE' in weekly_df.columns else None
+            w_ma20      = float(wl['MA20'])        if 'MA20'       in weekly_df.columns else None
+            w_close     = float(wl['close'])
+
+        # 融資融券
+        mg_ratio = None; mg_margin = None; mg_short = None
+        if margin_df is not None and len(margin_df) > 0:
+            ml = margin_df.iloc[-1]
+            for col in ['MarginPurchaseRemainingVolume', 'margin_purchase_remaining', 'MarginPurchase']:
+                if col in margin_df.columns:
+                    mg_margin = float(ml[col]); break
+            for col in ['ShortSaleRemainingVolume', 'short_sale_remaining', 'ShortSale']:
+                if col in margin_df.columns:
+                    mg_short  = float(ml[col]); break
+            for col in ['MarginPurchaseRatio', 'margin_ratio']:
+                if col in margin_df.columns:
+                    mg_ratio  = float(ml[col]); break
+
+        # 三大法人近10日加總
+        inst_summary = ""
+        if institutional_df is not None and len(institutional_df) > 0:
+            try:
+                inst_tail = institutional_df.tail(10)
+                for col in ['Foreign_Investor', 'ForeignInvestor', 'foreign']:
+                    if col in inst_tail.columns:
+                        inst_summary += f"外資10日:{inst_tail[col].sum():.0f}張 "
+                        break
+                for col in ['Investment_Trust', 'InvestmentTrust', 'investment_trust']:
+                    if col in inst_tail.columns:
+                        inst_summary += f"投信10日:{inst_tail[col].sum():.0f}張 "
+                        break
+                for col in ['Dealer_self', 'DealerSelf', 'dealer']:
+                    if col in inst_tail.columns:
+                        inst_summary += f"自營10日:{inst_tail[col].sum():.0f}張 "
+                        break
+            except Exception:
+                pass
+
+        # 組裝 prompt 摘要
+        lines = [
+            f"股票代碼：{symbol}（{market_desc}）",
+            f"最新收盤：{currency}{close:.2f}",
+        ]
+        if rsi_val:  lines.append(f"RSI({rsi_period})：{rsi_val:.2f}")
+        if ma5:      lines.append(f"MA5={ma5:.2f}  MA10={ma10:.2f}  MA20={ma20:.2f}  MA60={ma60:.2f}")
+        if bb_u:     lines.append(f"布林上軌={bb_u:.2f}  中軌={bb_m:.2f}  下軌={bb_l:.2f}")
+        if macd_dif: lines.append(f"日MACD DIF={macd_dif:.4f}  SIGNAL={macd_line:.4f}  HIST={macd_hist:.4f}")
+        if adx_val:  lines.append(f"ADX={adx_val:.2f}")
+        if vol_today and vol_20avg:
+            lines.append(f"今日量={vol_today:.0f}  5日均量={vol_5avg:.0f}  20日均量={vol_20avg:.0f}")
+        if w_macd_dif:
+            lines.append(f"週MACD DIF={w_macd_dif:.4f}  SIGNAL={w_macd_line:.4f}")
+        if w_ma20 and w_close:
+            lines.append(f"週收盤={w_close:.2f}  週MA20={w_ma20:.2f}")
+        if mg_margin:
+            lines.append(f"融資餘額={mg_margin:.0f}  融券餘額={mg_short:.0f}  融資比={mg_ratio}")
+        if inst_summary:
+            lines.append(f"三大法人：{inst_summary}")
+        if bull_signals:
+            lines.append(f"多頭訊號評分：{bull_signals['total_score']:.0f}/100 — {bull_signals['conclusion']}")
+        if zhu_result:
+            lines.append(f"朱家泓趨勢評分：{zhu_result['score']}/100 — {zhu_result['action_label']} — 趨勢:{zhu_result['trend']}")
+
+        data_summary = "\n".join(lines)
+
+        system_msg = """你是台灣資深股票技術分析師，熟悉朱家泓多空操作秘笈分析框架。
+根據提供的技術指標數據，填入選股評量表格的各個欄位。
+請以 JSON 格式回傳，不加任何 markdown 符號或前綴文字，直接輸出 JSON 物件。
+欄位定義如下：
+- 波型描述：以「↑上升波」「↓下降波」「→震盪整理」描述月/週/日K線形態
+- 位置：以「底部」「中段」「頂部」「頸線附近」描述週/日線所在波段位置
+- K線型態：描述最近1-2根K線的形態（如：長紅實體、下影線、吞噬、十字星等）
+- 均線描述：以「多頭排列」「空頭排列」「糾結」「扣抵向上/下」描述
+- 切線描述：以「上升切線」「下降切線」「水平整理」描述趨勢線方向
+- 成交量描述：以「放量」「縮量」「量增價漲」「量縮整理」「爆量出貨」等描述
+- 指標描述：MACD以「金叉」「死叉」「柱縮」「柱增」「零軸上下」描述；KD以「金叉」「死叉」「高檔鈍化」「低檔鈍化」描述
+- 支撐/壓力：給出具體價位數值
+- 背離：「頂背離」「底背離」「無明顯背離」
+- 融資融券：描述增減趨勢
+- 法人買賣超：描述多空傾向
+- 型態：識別技術型態（W底/頭肩底/旗形/三角收斂/突破/上升通道等）
+- 策略：給出具體操作策略建議（含進出場條件）
+"""
+
+        user_msg = f"""根據以下技術指標數據，填入朱家泓選股評量表所有欄位，以 JSON 輸出：
+
+{data_summary}
+
+請輸出以下 JSON 結構（所有值為字串，具體簡潔，不超過30字）：
+{{
+  "波型_月線": "",
+  "波型_週線": "",
+  "波型_日線": "",
+  "位置_週線": "",
+  "位置_日線": "",
+  "K線_週": "",
+  "K線_日": "",
+  "均線_週": "",
+  "均線_日": "",
+  "切線": "",
+  "成交量_週": "",
+  "成交量_日": "",
+  "指標_週MACD": "",
+  "指標_週KD": "",
+  "指標_日MACD": "",
+  "指標_日KD": "",
+  "支撐_週": "",
+  "支撐_日": "",
+  "壓力_週": "",
+  "壓力_日": "",
+  "背離": "",
+  "融資": "",
+  "融券": "",
+  "融資比": "",
+  "法人買賣超": "",
+  "型態": "",
+  "其他": "",
+  "策略": ""
+}}
+"""
+
+        response = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[
+                {"role": "system", "content": system_msg},
+                {"role": "user",   "content": user_msg},
+            ],
+            max_tokens=900,
+            temperature=0.3
+        )
+        raw = response.choices[0].message.content.strip()
+        # 清除可能的 markdown 包裹
+        raw = raw.replace("```json", "").replace("```", "").strip()
+        return json.loads(raw)
+
+    except Exception as e:
+        return {"_error": str(e)}
+
+
 def generate_investment_advice(symbol, stock_data, openai_api_key, market='us', zhu_result=None,
                                 bull_signals=None, rsi_period=14,
                                 institutional_df=None, margin_df=None,
@@ -5143,6 +5324,169 @@ if analyze_button:
                         st.markdown(investment_advice)
 
                     st.success("✅ 分析完成！")
+
+                    # ── 顯示 16：選股評量表格（分析完成後自動 AI 填入）──
+                    st.markdown("---")
+                    st.markdown("### 📋 選股評量表格")
+                    st.caption("依據朱家泓《多空操作秘笈》圖表10-3-1 — AI 自動填入，可手動微調後下載")
+
+                    _eval_symbol = symbol.strip() if is_tw else symbol.upper()
+                    _eval_key    = f"eval_{_eval_symbol}"
+
+                    # 每次分析自動 AI 填入（以「股票+小時」作為快取鍵，避免重複呼叫）
+                    _ts_now = f"{_eval_symbol}_{datetime.now().strftime('%Y%m%d%H')}"
+                    if st.session_state.get("last_eval_ts") != _ts_now or not st.session_state.get(_eval_key):
+                        _ai_result = generate_stock_evaluation(
+                            symbol=_eval_symbol,
+                            stock_data=data_with_indicators,
+                            openai_api_key=openai_api_key,
+                            market=market_key,
+                            zhu_result=zhu_result,
+                            bull_signals=bull_signals,
+                            rsi_period=rsi_period,
+                            institutional_df=institutional_df if is_tw else None,
+                            margin_df=margin_df if is_tw else None,
+                            weekly_df=weekly_df if 'weekly_df' in dir() else None,
+                            financial_data=financial_data if is_tw else None,
+                            analyst_data=analyst_data,
+                            insider_df=insider_df,
+                            director_df=director_df if is_tw else None,
+                        )
+                        if "_error" not in _ai_result:
+                            st.session_state[_eval_key] = _ai_result
+                            st.session_state["last_eval_ts"] = _ts_now
+                        else:
+                            st.session_state.setdefault(_eval_key, {})
+
+                    with st.expander("📝 選股評量表格（點擊展開／收合）", expanded=True):
+                        # 標題資訊列
+                        _col_date, _col_biz, _col_cap = st.columns([1, 2, 1])
+                        with _col_date:
+                            _eval_date = st.date_input("日期", value=datetime.now().date(),
+                                key=f"{_eval_key}_date")
+                        with _col_biz:
+                            _eval_biz = st.text_input("營業項目",
+                                value=st.session_state[_eval_key].get("營業項目", ""),
+                                key=f"{_eval_key}_biz")
+                        with _col_cap:
+                            _eval_cap = st.text_input("股本（億）",
+                                value=st.session_state[_eval_key].get("股本", ""),
+                                key=f"{_eval_key}_cap")
+
+                        st.markdown("#### 基本面")
+                        _eval_fundamental = st.text_area("基本面說明",
+                            value=st.session_state[_eval_key].get("基本面", ""),
+                            height=60, key=f"{_eval_key}_fundamental",
+                            label_visibility="collapsed",
+                            placeholder="輸入基本面重點（EPS、營收、產業趨勢等）...")
+
+                        # 表格左右兩欄對應結構
+                        _left_col, _right_col = st.columns(2)
+
+                        with _left_col:
+                            st.markdown("**波型（V）**")
+                            _c1, _c2, _c3 = st.columns(3)
+                            _eval_wave_m = _c1.text_input("月線", value=st.session_state[_eval_key].get("波型_月線",""), key=f"{_eval_key}_wave_m", placeholder="↑/↓/震盪")
+                            _eval_wave_w = _c2.text_input("週線", value=st.session_state[_eval_key].get("波型_週線",""), key=f"{_eval_key}_wave_w", placeholder="↑/↓/震盪")
+                            _eval_wave_d = _c3.text_input("日線", value=st.session_state[_eval_key].get("波型_日線",""), key=f"{_eval_key}_wave_d", placeholder="↑/↓/震盪")
+
+                            st.markdown("**位置**")
+                            _c1, _c2 = st.columns(2)
+                            _eval_pos_w = _c1.text_input("週線位置", value=st.session_state[_eval_key].get("位置_週線",""), key=f"{_eval_key}_pos_w", placeholder="底/中/頂")
+                            _eval_pos_d = _c2.text_input("日線位置", value=st.session_state[_eval_key].get("位置_日線",""), key=f"{_eval_key}_pos_d", placeholder="底/中/頂")
+
+                            st.markdown("**K線（V）**")
+                            _c1, _c2 = st.columns(2)
+                            _eval_k_w = _c1.text_input("週K線", value=st.session_state[_eval_key].get("K線_週",""), key=f"{_eval_key}_k_w", placeholder="型態描述")
+                            _eval_k_d = _c2.text_input("日K線", value=st.session_state[_eval_key].get("K線_日",""), key=f"{_eval_key}_k_d", placeholder="型態描述")
+
+                            st.markdown("**均線（V）／切線（V）**")
+                            _c1, _c2, _c3 = st.columns(3)
+                            _eval_ma_w = _c1.text_input("週均線", value=st.session_state[_eval_key].get("均線_週",""), key=f"{_eval_key}_ma_w", placeholder="多頭/空頭")
+                            _eval_ma_d = _c2.text_input("日均線", value=st.session_state[_eval_key].get("均線_日",""), key=f"{_eval_key}_ma_d", placeholder="多頭/空頭")
+                            _eval_ma_cut = _c3.text_input("切線", value=st.session_state[_eval_key].get("切線",""), key=f"{_eval_key}_ma_cut", placeholder="向上/向下")
+
+                            st.markdown("**成交量（V）**")
+                            _c1, _c2 = st.columns(2)
+                            _eval_vol_w = _c1.text_input("週量", value=st.session_state[_eval_key].get("成交量_週",""), key=f"{_eval_key}_vol_w", placeholder="放量/縮量")
+                            _eval_vol_d = _c2.text_input("日量", value=st.session_state[_eval_key].get("成交量_日",""), key=f"{_eval_key}_vol_d", placeholder="放量/縮量")
+
+                            st.markdown("**指標（V）**")
+                            _c1, _c2, _c3, _c4 = st.columns(4)
+                            _eval_ind_wmacd = _c1.text_input("週MACD", value=st.session_state[_eval_key].get("指標_週MACD",""), key=f"{_eval_key}_ind_wmacd", placeholder="金/死叉")
+                            _eval_ind_wkd   = _c2.text_input("週KD",   value=st.session_state[_eval_key].get("指標_週KD",""),   key=f"{_eval_key}_ind_wkd",   placeholder="金/死叉")
+                            _eval_ind_dmacd = _c3.text_input("日MACD", value=st.session_state[_eval_key].get("指標_日MACD",""), key=f"{_eval_key}_ind_dmacd", placeholder="金/死叉")
+                            _eval_ind_dkd   = _c4.text_input("日KD",   value=st.session_state[_eval_key].get("指標_日KD",""),   key=f"{_eval_key}_ind_dkd",   placeholder="金/死叉")
+
+                        with _right_col:
+                            st.markdown("**支撐**")
+                            _c1, _c2 = st.columns(2)
+                            _eval_sup_w = _c1.text_input("週支撐", value=st.session_state[_eval_key].get("支撐_週",""), key=f"{_eval_key}_sup_w", placeholder="價位")
+                            _eval_sup_d = _c2.text_input("日支撐", value=st.session_state[_eval_key].get("支撐_日",""), key=f"{_eval_key}_sup_d", placeholder="價位")
+
+                            st.markdown("**壓力**")
+                            _c1, _c2 = st.columns(2)
+                            _eval_res_w = _c1.text_input("週壓力", value=st.session_state[_eval_key].get("壓力_週",""), key=f"{_eval_key}_res_w", placeholder="價位")
+                            _eval_res_d = _c2.text_input("日壓力", value=st.session_state[_eval_key].get("壓力_日",""), key=f"{_eval_key}_res_d", placeholder="價位")
+
+                            st.markdown("**背離**")
+                            _eval_diverge = st.text_input("背離描述", value=st.session_state[_eval_key].get("背離",""), key=f"{_eval_key}_diverge", placeholder="RSI/MACD 頂背離或底背離")
+
+                            st.markdown("**融資融券（V）**")
+                            _c1, _c2, _c3 = st.columns(3)
+                            _eval_margin   = _c1.text_input("融資",   value=st.session_state[_eval_key].get("融資",""),   key=f"{_eval_key}_margin",   placeholder="增/減")
+                            _eval_short    = _c2.text_input("融券",   value=st.session_state[_eval_key].get("融券",""),   key=f"{_eval_key}_short",    placeholder="增/減")
+                            _eval_mratio   = _c3.text_input("融資比", value=st.session_state[_eval_key].get("融資比",""), key=f"{_eval_key}_mratio",   placeholder="百分比")
+
+                            st.markdown("**法人買賣超**")
+                            _eval_inst = st.text_input("法人買賣超", value=st.session_state[_eval_key].get("法人買賣超",""), key=f"{_eval_key}_inst", placeholder="外資/投信/自營合計")
+
+                            st.markdown("**型態**")
+                            _eval_pattern = st.text_input("型態描述", value=st.session_state[_eval_key].get("型態",""), key=f"{_eval_key}_pattern", placeholder="頭肩底/雙底/杯柄/旗形...")
+
+                            st.markdown("**其他**")
+                            _eval_other = st.text_input("其他備註", value=st.session_state[_eval_key].get("其他",""), key=f"{_eval_key}_other", placeholder="財報、重大訊息、產業動態...")
+
+                        # 策略欄位（全寬）
+                        st.markdown("**📌 策略**")
+                        _eval_strategy = st.text_area("操作策略",
+                            value=st.session_state[_eval_key].get("策略", ""),
+                            height=80, key=f"{_eval_key}_strategy",
+                            label_visibility="collapsed",
+                            placeholder="記錄進出場條件、停損停利設定、操作方向（做多/做空/觀望）...")
+
+                        # 儲存按鈕
+                        if st.button("💾 儲存評量記錄", key=f"{_eval_key}_save"):
+                            st.session_state[_eval_key] = {
+                                "日期": str(_eval_date), "營業項目": _eval_biz, "股本": _eval_cap,
+                                "基本面": _eval_fundamental,
+                                "波型_月線": _eval_wave_m, "波型_週線": _eval_wave_w, "波型_日線": _eval_wave_d,
+                                "位置_週線": _eval_pos_w, "位置_日線": _eval_pos_d,
+                                "K線_週": _eval_k_w, "K線_日": _eval_k_d,
+                                "均線_週": _eval_ma_w, "均線_日": _eval_ma_d, "切線": _eval_ma_cut,
+                                "成交量_週": _eval_vol_w, "成交量_日": _eval_vol_d,
+                                "指標_週MACD": _eval_ind_wmacd, "指標_週KD": _eval_ind_wkd,
+                                "指標_日MACD": _eval_ind_dmacd, "指標_日KD": _eval_ind_dkd,
+                                "支撐_週": _eval_sup_w, "支撐_日": _eval_sup_d,
+                                "壓力_週": _eval_res_w, "壓力_日": _eval_res_d,
+                                "背離": _eval_diverge,
+                                "融資": _eval_margin, "融券": _eval_short, "融資比": _eval_mratio,
+                                "法人買賣超": _eval_inst, "型態": _eval_pattern, "其他": _eval_other,
+                                "策略": _eval_strategy,
+                            }
+                            st.success(f"✅ 已儲存 {_eval_symbol} 的評量記錄（本次 session 有效）")
+
+                        # 匯出 CSV 按鈕
+                        if st.session_state[_eval_key]:
+                            _eval_df = pd.DataFrame([st.session_state[_eval_key]])
+                            _eval_csv = _eval_df.to_csv(index=False).encode("utf-8-sig")
+                            st.download_button(
+                                "📥 下載評量表 CSV",
+                                _eval_csv,
+                                file_name=f"選股評量_{_eval_symbol}_{datetime.now().strftime('%Y%m%d')}.csv",
+                                mime="text/csv",
+                                key=f"{_eval_key}_download"
+                            )
 
             else:
                 st.warning("所選日期範圍內沒有交易數據，請調整日期範圍。")
