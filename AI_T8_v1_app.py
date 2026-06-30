@@ -2485,11 +2485,587 @@ def display_bull_dashboard(bull_signals, symbol):
         st.caption("⚠️ 此評分基於近期歷史數據的技術面統計，不構成任何投資建議。歷史表現不代表未來結果。")
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# K線分析系統 — 朱家泓《多空操作秘笈》K線型態辨識
+# 來源：朱家泓-K線.docx 第3章 3-1～3-6
+#   3-1 K線起源與基本概念 / 高低點壓力支撐
+#   3-2 K線高檔反轉的3大型態訊號（變盤線／覆蓋／貫穿／吞噬／母子懷抱／夜星）
+#   3-3 K線低檔反轉的3大型態訊號（變盤線／覆蓋／貫穿／吞噬／母子懷抱／晨星）
+#   3-4 不同位置的大量紅黑K判讀（高檔出貨 vs 低檔進場／槌子倒槌）
+#   3-5 不同K線組合的意義（上升三法／下降三法／連3紅／連3黑）
+#   3-6 趨勢軌道線突破與跌破
+#
+# 台股慣例：紅K＝收盤>開盤（上漲），黑K＝收盤<開盤（下跌）
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _kline_basic(row):
+    """單根K線基礎結構：實體、影線、紅黑判斷"""
+    o, h, l, c = float(row['open']), float(row['high']), float(row['low']), float(row['close'])
+    rng = max(h - l, 1e-9)
+    body = abs(c - o)
+    body_pct = body / rng
+    upper_shadow = (h - max(o, c)) / rng
+    lower_shadow = (min(o, c) - l) / rng
+    is_red = c > o          # 紅K（上漲）
+    is_black = c < o        # 黑K（下跌）
+    is_flat = c == o
+    return {
+        'o': o, 'h': h, 'l': l, 'c': c, 'rng': rng, 'body': body,
+        'body_pct': body_pct, 'upper_shadow': upper_shadow, 'lower_shadow': lower_shadow,
+        'is_red': is_red, 'is_black': is_black, 'is_flat': is_flat,
+    }
+
+
+def _classify_single_kline(k, long_body_thr=0.6, small_body_thr=0.15, shadow_long_thr=0.5):
+    """
+    辨識單根K線型態（依朱家泓圖表3-2-1 / 3-3-1 高低檔變盤K線分類）：
+    長紅線/長黑線、十字線、紡錘線、槌子線、吊人線、倒槌線、倒T線、
+    墓碑線、長T線（蜻蜓十字）
+    """
+    bp = k['body_pct']
+    us = k['upper_shadow']
+    ls = k['lower_shadow']
+
+    # 長紅/長黑：實體佔比高
+    if bp >= long_body_thr:
+        return '長紅線' if k['is_red'] else ('長黑線' if k['is_black'] else '長十字線')
+
+    # 十字線族：實體極小
+    if bp <= 0.05:
+        if us >= shadow_long_thr and ls >= shadow_long_thr:
+            return '十字線'
+        if ls >= shadow_long_thr and us <= 0.1:
+            return '長T線'      # 蜻蜓十字（下影線長，開收盤同高點）
+        if us >= shadow_long_thr and ls <= 0.1:
+            return '墓碑線'      # 墓碑十字（上影線長，開收盤同低點）
+        return '一字線' if (us <= 0.05 and ls <= 0.05) else '十字線'
+
+    # 小實體 + 長下影線：槌子／吊人（依位置由外部判斷高低檔意義）
+    if bp <= small_body_thr * 2 and ls >= shadow_long_thr and us <= 0.15:
+        return '槌子線'   # 實體紅黑不重要，下影線長
+
+    # 小實體 + 長上影線：倒槌／流星
+    if bp <= small_body_thr * 2 and us >= shadow_long_thr and ls <= 0.15:
+        return '倒槌線'
+
+    # 紡錘線：小實體 + 上下影線都不算太長
+    if bp <= small_body_thr:
+        return '紡錘線'
+
+    return '一般K線'
+
+
+def _detect_two_candle_pattern(k1, k2):
+    """
+    辨識兩根K線組合型態（圖表3-2-x／3-3-x）：
+    母子懷抱、長黑覆蓋(烏雲罩頂)、長紅覆蓋、長黑貫穿、長紅貫穿、長黑吞噬、長紅吞噬
+    k1 = 前一根（母線）, k2 = 最新一根（子線）
+    """
+    patterns = []
+
+    # ── 母子懷抱：k1為中長紅/黑實體，k2完全包覆在k1實體內 ──
+    if k1['body_pct'] >= 0.4:
+        k1_top, k1_bot = max(k1['o'], k1['c']), min(k1['o'], k1['c'])
+        k2_top, k2_bot = max(k2['o'], k2['c']), min(k2['o'], k2['c'])
+        if k2_top <= k1_top and k2_bot >= k1_bot:
+            if k1['is_red']:
+                patterns.append('母子懷抱(高檔不懷好意)' if False else '母子懷抱')
+            elif k1['is_black']:
+                patterns.append('母子懷抱')
+
+    # ── 長黑覆蓋 / 烏雲罩頂：前紅後黑，黑K開盤穿入或高於前紅K高點，收盤深入前紅K實體 ──
+    if k1['is_red'] and k2['is_black'] and k1['body_pct'] >= 0.4:
+        k1_top, k1_bot = max(k1['o'], k1['c']), min(k1['o'], k1['c'])
+        penetration = (k1_top - k2['c']) / (k1_top - k1_bot + 1e-9)
+        if k2['o'] >= k1['c'] and 0.3 <= penetration <= 1.0:
+            patterns.append('長黑覆蓋(烏雲罩頂)')
+
+    # ── 長紅覆蓋：前黑後紅，紅K開盤低於前黑K低點或收盤，深入前黑K實體 ──
+    if k1['is_black'] and k2['is_red'] and k1['body_pct'] >= 0.4:
+        k1_top, k1_bot = max(k1['o'], k1['c']), min(k1['o'], k1['c'])
+        penetration = (k2['c'] - k1_bot) / (k1_top - k1_bot + 1e-9)
+        if k2['o'] <= k1['c'] and 0.3 <= penetration <= 1.0:
+            patterns.append('長紅覆蓋')
+
+    # ── 長黑貫穿：前紅後黑，黑K收盤跌破前紅K低點（一次貫穿前低）──
+    if k1['is_red'] and k2['is_black'] and k1['body_pct'] >= 0.4:
+        if k2['c'] < min(k1['o'], k1['c']):
+            patterns.append('長黑貫穿')
+
+    # ── 長紅貫穿：前黑後紅，紅K收盤突破前黑K高點（一次貫穿前高）──
+    if k1['is_black'] and k2['is_red'] and k1['body_pct'] >= 0.4:
+        if k2['c'] > max(k1['o'], k1['c']):
+            patterns.append('長紅貫穿')
+
+    # ── 長黑吞噬：黑K實體完全吞噬前一根紅K實體（含開高收低）──
+    if k1['is_red'] and k2['is_black']:
+        if k2['o'] >= k1['c'] and k2['c'] <= k1['o']:
+            patterns.append('長黑吞噬')
+
+    # ── 長紅吞噬：紅K實體完全吞噬前一根黑K實體 ──
+    if k1['is_black'] and k2['is_red']:
+        if k2['o'] <= k1['c'] and k2['c'] >= k1['o']:
+            patterns.append('長紅吞噬')
+
+    return patterns
+
+
+def _detect_three_candle_pattern(k1, k2, k3):
+    """
+    辨識三根K線組合（晨星／夜星）（圖表3-2-x／3-3-x）
+    k1=第一根, k2=中間變盤K, k3=確認K
+    """
+    patterns = []
+    k1_top, k1_bot = max(k1['o'], k1['c']), min(k1['o'], k1['c'])
+    k3_top, k3_bot = max(k3['o'], k3['c']), min(k3['o'], k3['c'])
+    mid = (k1_top + k1_bot) / 2
+
+    # 夜星：高檔長紅 + 跳空小實體（變盤線）+ 長黑收破前紅K中點以下
+    if k1['is_red'] and k1['body_pct'] >= 0.4 and k2['body_pct'] <= 0.35:
+        gapped_up = min(k2['o'], k2['c']) >= k1['c'] * 0.998
+        if k3['is_black'] and k3['c'] < mid and gapped_up:
+            patterns.append('夜星轉折')
+
+    # 晨星：低檔長黑 + 跳空小實體（變盤線）+ 長紅收過前黑K中點以上
+    if k1['is_black'] and k1['body_pct'] >= 0.4 and k2['body_pct'] <= 0.35:
+        gapped_dn = max(k2['o'], k2['c']) <= k1['c'] * 1.002
+        if k3['is_red'] and k3['c'] > mid and gapped_dn:
+            patterns.append('晨星轉折')
+
+    return patterns
+
+
+def _detect_three_soldiers_crows(k_list):
+    """
+    辨識連續3黑／連續3紅（圖表3-5-22～3-5-25）
+    k_list = 最近3根K線（由舊到新）
+    """
+    if len(k_list) < 3:
+        return None
+    if all(k['is_black'] for k in k_list):
+        closes = [k['c'] for k in k_list]
+        if closes[0] > closes[1] > closes[2]:
+            return '下跌連3黑'
+    if all(k['is_red'] for k in k_list):
+        closes = [k['c'] for k in k_list]
+        if closes[0] < closes[1] < closes[2]:
+            return '上漲連3紅'
+    return None
+
+
+def _detect_rising_falling_three_method(k_list):
+    """
+    辨識上升三法／下降三法（圖表3-5-1～3-5-15）
+    需要5根K線：中長K + 2~3根反向小K（不破前低/不過前高）+ 同向中長K創新高/新低
+    k_list：最近5根（舊到新）
+    """
+    if len(k_list) < 5:
+        return None
+    k0, k_mid, k4 = k_list[0], k_list[1:-1], k_list[-1]
+
+    # 上升三法：k0長紅，中間1~3根小黑/小紅未跌破k0低點，k4長紅創新高（突破k0高點）
+    if k0['is_red'] and k0['body_pct'] >= 0.4:
+        k0_low = min(k0['o'], k0['c'])
+        k0_high = max(k0['o'], k0['c'])
+        mid_ok = all(min(km['o'], km['c']) >= k0_low for km in k_mid) and all(km['body_pct'] <= 0.5 for km in k_mid)
+        if mid_ok and k4['is_red'] and k4['c'] > k0_high:
+            return '上升三法'
+
+    # 下降三法：k0長黑，中間小紅/小黑未突破k0高點，k4長黑創新低（跌破k0低點）
+    if k0['is_black'] and k0['body_pct'] >= 0.4:
+        k0_low = min(k0['o'], k0['c'])
+        k0_high = max(k0['o'], k0['c'])
+        mid_ok = all(max(km['o'], km['c']) <= k0_high for km in k_mid) and all(km['body_pct'] <= 0.5 for km in k_mid)
+        if mid_ok and k4['is_black'] and k4['c'] < k0_low:
+            return '下降三法'
+
+    return None
+
+
+def calculate_kline_pattern_system(df):
+    """
+    朱家泓 K線型態分析系統 — 產生 0–100 分的K線結構評分。
+    來源：《多空操作秘笈》第3章 K線高低檔反轉型態 + 大量紅黑K判讀 + 趨勢軌道。
+
+    評分邏輯（共 6 大項）：
+      1. 單根K線變盤訊號        15分（高檔出現黑K變盤線 / 低檔出現紅K變盤線）
+      2. 兩根K線反轉組合        20分（覆蓋／貫穿／吞噬／母子懷抱，依高低檔位置判斷多空）
+      3. 三根K線晨星/夜星       15分
+      4. 連續K線型態            15分（上升三法/下降三法/連3紅/連3黑）
+      5. 大量紅黑K位置判讀      20分（依朱家泓3-4：高檔大量紅K減分／低檔大量紅K加分）
+      6. 趨勢軌道位置           15分（股價相對近期高低點壓力支撐位置）
+
+    總分 ≥ 60 → K線結構偏多；< 40 → K線結構偏空。
+    """
+    result = {
+        'score': 0,
+        'max_score': 100,
+        'items': [],
+        'kline_trend': 'neutral',     # 'bull' / 'bear' / 'neutral'
+        'patterns_found': [],          # 命中的型態名稱列表
+        'latest_kline_type': None,     # 最新一根K線分類
+        'position_context': None,      # '高檔' / '低檔' / '盤整' / '行進中'
+        'action_label': '⚪ 觀望',
+        'detail': {},
+    }
+
+    def add_item(name, score, max_score, status, desc):
+        result['items'].append({'name': name, 'score': score, 'max': max_score, 'status': status, 'desc': desc})
+        result['score'] += score
+
+    n = len(df)
+    if n < 10:
+        add_item('資料檢查', 0, 100, 'red', '資料不足，無法進行K線型態分析')
+        result['action_label'] = '⚪ 資料不足'
+        return result
+
+    # 準備最近K線結構（最多取最近10根供型態判讀）
+    tail_n = min(10, n)
+    recent = df.tail(tail_n).reset_index(drop=True)
+    klines = [_kline_basic(recent.iloc[i]) for i in range(tail_n)]
+
+    latest = klines[-1]
+    prev1  = klines[-2] if tail_n >= 2 else None
+    prev2  = klines[-3] if tail_n >= 3 else None
+
+    # ── 判斷目前位置：高檔 / 低檔 / 盤整 / 行進中（依近20日相對位置）──
+    look = min(20, n - 1)
+    recent_high = df['high'].iloc[-look-1:-1].max() if n > look else df['high'].max()
+    recent_low  = df['low'].iloc[-look-1:-1].min()  if n > look else df['low'].min()
+    c_now = latest['c']
+    rel_pos = (c_now - recent_low) / (recent_high - recent_low + 1e-9)  # 0=低檔, 1=高檔
+
+    if rel_pos >= 0.75:
+        position = '高檔'
+    elif rel_pos <= 0.25:
+        position = '低檔'
+    else:
+        position = '行進中'
+    result['position_context'] = position
+    result['detail']['rel_pos'] = round(rel_pos, 2)
+    result['detail']['recent_high'] = recent_high
+    result['detail']['recent_low']  = recent_low
+
+    # ─── 1. 單根K線變盤訊號（15分）─────────────────────────────
+    try:
+        k_type = _classify_single_kline(latest)
+        result['latest_kline_type'] = k_type
+        avg_vol = df['volume'].tail(20).mean() if 'volume' in df.columns else None
+        vol_now = df['volume'].iloc[-1] if 'volume' in df.columns else None
+        vol_surge = bool(avg_vol and vol_now and vol_now > avg_vol * 1.3)
+
+        # 高檔變盤線（看跌）：墓碑線、十字線、倒槌線、長黑線、吊人線型態
+        bearish_reversal_k = k_type in ('墓碑線', '十字線', '倒槌線', '長黑線')
+        # 低檔變盤線（看漲）：長T線、十字線、槌子線、長紅線
+        bullish_reversal_k = k_type in ('長T線', '十字線', '槌子線', '長紅線')
+
+        if position == '高檔' and bearish_reversal_k:
+            score = 3 if k_type == '長黑線' and not vol_surge else (15 if vol_surge else 9)
+            add_item('單根K線變盤訊號', score, 15, 'red' if score <= 6 else 'yellow',
+                     f"高檔出現「{k_type}」{'（爆量，反轉訊號強）' if vol_surge else '，留意反轉風險'}")
+        elif position == '低檔' and bullish_reversal_k:
+            score = 3 if k_type == '長紅線' and not vol_surge else (15 if vol_surge else 9)
+            add_item('單根K線變盤訊號', score, 15, 'green' if score >= 9 else 'yellow',
+                     f"低檔出現「{k_type}」{'（爆量，止跌訊號強）' if vol_surge else '，留意止跌反彈'}")
+        elif k_type == '長紅線':
+            add_item('單根K線變盤訊號', 10, 15, 'green', f"當前為「{k_type}」，多方力道強勁")
+        elif k_type == '長黑線':
+            add_item('單根K線變盤訊號', 2, 15, 'red', f"當前為「{k_type}」，空方力道強勁")
+        else:
+            add_item('單根K線變盤訊號', 7, 15, 'yellow', f"當前為「{k_type}」，位置：{position}，無明顯變盤訊號")
+        result['detail']['vol_surge'] = vol_surge
+    except Exception:
+        add_item('單根K線變盤訊號', 0, 15, 'red', '無法計算')
+
+    # ─── 2. 兩根K線反轉組合（20分）─────────────────────────────
+    try:
+        two_patterns = _detect_two_candle_pattern(prev1, latest) if prev1 else []
+        result['patterns_found'].extend(two_patterns)
+
+        bearish_2k = {'長黑覆蓋(烏雲罩頂)', '長黑貫穿', '長黑吞噬'}
+        bullish_2k = {'長紅覆蓋', '長紅貫穿', '長紅吞噬'}
+        harami_set = {'母子懷抱'}
+
+        hit_bear = [p for p in two_patterns if p in bearish_2k]
+        hit_bull = [p for p in two_patterns if p in bullish_2k]
+        hit_harami = [p for p in two_patterns if p in harami_set]
+
+        if position == '高檔' and hit_bear:
+            add_item('兩根K線反轉組合', 2, 20, 'red',
+                     f"高檔出現「{'、'.join(hit_bear)}」，空頭轉折訊號強，留意反轉向下")
+        elif position == '低檔' and hit_bull:
+            add_item('兩根K線反轉組合', 20, 20, 'green',
+                     f"低檔出現「{'、'.join(hit_bull)}」，多頭轉折訊號強，留意止跌反彈")
+        elif position == '高檔' and hit_harami:
+            add_item('兩根K線反轉組合', 5, 20, 'yellow',
+                     "高檔出現「母子懷抱」，多空力道收斂，上漲力道減弱，注意是否轉折向下")
+        elif position == '低檔' and hit_harami:
+            add_item('兩根K線反轉組合', 14, 20, 'green',
+                     "低檔出現「母子懷抱」，下跌力道收斂，留意止跌訊號（光明在望）")
+        elif hit_bull:
+            add_item('兩根K線反轉組合', 14, 20, 'green', f"出現「{'、'.join(hit_bull)}」，偏多訊號")
+        elif hit_bear:
+            add_item('兩根K線反轉組合', 4, 20, 'red', f"出現「{'、'.join(hit_bear)}」，偏空訊號")
+        else:
+            add_item('兩根K線反轉組合', 10, 20, 'yellow', '近2根K線無明顯反轉組合')
+    except Exception:
+        add_item('兩根K線反轉組合', 0, 20, 'red', '無法計算')
+
+    # ─── 3. 三根K線晨星/夜星（15分）────────────────────────────
+    try:
+        three_patterns = []
+        if prev2 is not None:
+            three_patterns = _detect_three_candle_pattern(prev2, prev1, latest)
+        result['patterns_found'].extend(three_patterns)
+
+        if '夜星轉折' in three_patterns:
+            if position == '高檔':
+                add_item('晨星/夜星型態', 2, 15, 'red', "高檔出現「夜星轉折」，強力反轉向下訊號")
+            else:
+                add_item('晨星/夜星型態', 5, 15, 'yellow', "出現「夜星轉折」，留意轉弱")
+        elif '晨星轉折' in three_patterns:
+            if position == '低檔':
+                add_item('晨星/夜星型態', 15, 15, 'green', "低檔出現「晨星轉折」，強力止跌反彈訊號")
+            else:
+                add_item('晨星/夜星型態', 10, 15, 'green', "出現「晨星轉折」，偏多訊號")
+        else:
+            add_item('晨星/夜星型態', 8, 15, 'yellow', '近期無晨星/夜星型態')
+    except Exception:
+        add_item('晨星/夜星型態', 0, 15, 'red', '無法計算')
+
+    # ─── 4. 連續K線型態（上升三法/下降三法/連3紅/連3黑）（15分）──
+    try:
+        cont_patterns = []
+        three_soldiers = _detect_three_soldiers_crows(klines[-3:]) if tail_n >= 3 else None
+        if three_soldiers:
+            cont_patterns.append(three_soldiers)
+        method5 = _detect_rising_falling_three_method(klines[-5:]) if tail_n >= 5 else None
+        if method5:
+            cont_patterns.append(method5)
+        result['patterns_found'].extend(cont_patterns)
+
+        if '上升三法' in cont_patterns:
+            add_item('連續K線型態', 15, 15, 'green', "出現「上升三法」，多頭中繼，趨勢延續看漲")
+        elif '下降三法' in cont_patterns:
+            add_item('連續K線型態', 0, 15, 'red', "出現「下降三法」，空頭中繼，趨勢延續看跌")
+        elif '上漲連3紅' in cont_patterns:
+            if position == '高檔':
+                add_item('連續K線型態', 6, 15, 'yellow', "高檔連3紅，留意過熱拉回")
+            else:
+                add_item('連續K線型態', 12, 15, 'green', "出現「上漲連3紅」，多方動能轉強")
+        elif '下跌連3黑' in cont_patterns:
+            if position == '低檔':
+                add_item('連續K線型態', 9, 15, 'yellow', "低檔連3黑，留意止跌訊號（KD背離注意反彈）")
+            else:
+                add_item('連續K線型態', 2, 15, 'red', "出現「下跌連3黑」，空方動能轉強")
+        else:
+            add_item('連續K線型態', 7, 15, 'yellow', '近期無明顯連續K線型態')
+    except Exception:
+        add_item('連續K線型態', 0, 15, 'red', '無法計算')
+
+    # ─── 5. 大量紅黑K位置判讀（圖表3-4，20分）──────────────────
+    try:
+        avg_vol20 = df['volume'].tail(20).mean() if 'volume' in df.columns else None
+        vol_now   = df['volume'].iloc[-1] if 'volume' in df.columns else None
+        big_vol   = bool(avg_vol20 and vol_now and vol_now > avg_vol20 * 1.5)
+        is_red    = latest['is_red']
+        is_black  = latest['is_black']
+        long_body = latest['body_pct'] >= 0.4
+
+        if big_vol and is_red and long_body:
+            if position == '高檔':
+                add_item('大量紅黑K位置判讀', 4, 20, 'red',
+                         "高檔大量長紅K——可能為主力出貨訊號，依朱家泓3-4法則『日線高檔大量紅K不能買』")
+            elif position == '低檔':
+                add_item('大量紅黑K位置判讀', 20, 20, 'green',
+                         "低檔大量長紅K——空轉多訊號，依朱家泓3-4法則『空頭轉多頭第一次過前高的大量長紅K可買』")
+            else:
+                add_item('大量紅黑K位置判讀', 14, 20, 'green',
+                         "行進中大量長紅K，多頭續漲或盤整突破訊號，留意是否站穩")
+        elif big_vol and is_black and long_body:
+            if position == '高檔':
+                add_item('大量紅黑K位置判讀', 0, 20, 'red',
+                         "高檔大量長黑K——轉折向下訊號強，依朱家泓3-2法則應留意出場")
+            elif position == '低檔':
+                add_item('大量紅黑K位置判讀', 10, 20, 'yellow',
+                         "低檔大量長黑K——留意是否為主力誘空假跌破，須觀察次日是否止跌")
+            else:
+                add_item('大量紅黑K位置判讀', 6, 20, 'yellow',
+                         "行進中大量長黑K，留意回檔或轉折風險")
+        elif big_vol:
+            add_item('大量紅黑K位置判讀', 10, 20, 'yellow', f"近期爆量但K線非長紅/長黑，方向待確認（位置：{position}）")
+        else:
+            add_item('大量紅黑K位置判讀', 10, 20, 'yellow', f"近期成交量無明顯異常放大（位置：{position}）")
+
+        result['detail']['big_vol'] = big_vol
+    except Exception:
+        add_item('大量紅黑K位置判讀', 0, 20, 'red', '無法計算')
+
+    # ─── 6. 趨勢軌道位置（壓力支撐，圖表3-1/3-6，15分）─────────
+    try:
+        dist_to_high = (recent_high - c_now) / c_now * 100 if c_now > 0 else 0
+        dist_to_low  = (c_now - recent_low) / c_now * 100 if c_now > 0 else 0
+        broke_high   = c_now > recent_high
+        broke_low    = c_now < recent_low
+
+        if broke_high:
+            add_item('趨勢軌道位置', 15, 15, 'green', f"收盤突破近{look}日高點{recent_high:.2f}，上方壓力解除")
+        elif broke_low:
+            add_item('趨勢軌道位置', 0, 15, 'red', f"收盤跌破近{look}日低點{recent_low:.2f}，下方支撐失守")
+        elif dist_to_high <= 3:
+            add_item('趨勢軌道位置', 6, 15, 'yellow', f"接近近期高點壓力（距{dist_to_high:.1f}%），留意是否突破或拉回")
+        elif dist_to_low <= 3:
+            add_item('趨勢軌道位置', 9, 15, 'yellow', f"接近近期低點支撐（距{dist_to_low:.1f}%），留意是否止跌或破底")
+        else:
+            add_item('趨勢軌道位置', 8, 15, 'yellow', f"位於壓力({recent_high:.2f})與支撐({recent_low:.2f})區間中段")
+    except Exception:
+        add_item('趨勢軌道位置', 0, 15, 'red', '無法計算')
+
+    # ─── 彙整 ───────────────────────────────────────────────────
+    score = result['score']
+    if score >= 60:
+        result['kline_trend'] = 'bull'
+    elif score <= 40:
+        result['kline_trend'] = 'bear'
+    else:
+        result['kline_trend'] = 'neutral'
+
+    if score >= 75:
+        result['action_label'] = '🟢 K線結構強多頭'
+    elif score >= 60:
+        result['action_label'] = '🟢 K線結構偏多'
+    elif score >= 40:
+        result['action_label'] = '🟡 K線結構中性'
+    elif score >= 25:
+        result['action_label'] = '🟠 K線結構偏空'
+    else:
+        result['action_label'] = '🔴 K線結構強空頭'
+
+    result['patterns_found'] = list(dict.fromkeys(result['patterns_found']))  # 去重保序
+    return result
+
+
+def display_kline_pattern_dashboard(kline_result, symbol):
+    """顯示K線型態分析系統儀表板，風格與朱家泓趨勢線系統儀表板一致。"""
+    st.markdown("---")
+    st.markdown("### 🕯️ K線型態分析系統")
+    st.caption("依據朱家泓《多空操作秘笈》第3章 K線高低檔反轉型態 + 大量紅黑K判讀法則")
+
+    score = kline_result['score']
+    max_score = kline_result['max_score']
+    trend = kline_result['kline_trend']
+    items = kline_result['items']
+    patterns = kline_result['patterns_found']
+    position = kline_result['position_context']
+    k_type = kline_result['latest_kline_type']
+
+    col_score, col_action = st.columns([1, 2])
+
+    with col_score:
+        if score >= 60:
+            bar_color = '#2ed573'
+        elif score >= 40:
+            bar_color = '#f9ca24'
+        elif score >= 25:
+            bar_color = '#ff7f50'
+        else:
+            bar_color = '#ff4757'
+
+        st.markdown(f"""
+        <div style="
+            background: linear-gradient(135deg, #1a1a2e 0%, #16213e 100%);
+            border-radius: 16px;
+            padding: 20px;
+            text-align: center;
+            border: 2px solid {bar_color};
+        ">
+            <div style="font-size:13px;color:#aaa;margin-bottom:4px;">K線結構評分</div>
+            <div style="font-size:52px;font-weight:900;color:{bar_color};line-height:1;">
+                {score}
+            </div>
+            <div style="font-size:13px;color:#777;">/ {max_score} 分</div>
+            <div style="margin-top:10px;">
+                <div style="background:#333;border-radius:6px;height:8px;">
+                    <div style="background:{bar_color};width:{score}%;height:8px;border-radius:6px;"></div>
+                </div>
+            </div>
+            <div style="margin-top:10px;font-size:12px;color:#aaa;">
+                {"🐂 K線偏多" if trend=="bull" else ("🐻 K線偏空" if trend=="bear" else "⚖️ K線中性")}
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+    with col_action:
+        border_c = '#2ed573' if score >= 60 else ('#f9ca24' if score >= 40 else '#ff4757')
+        pattern_str = '、'.join(patterns) if patterns else '無明顯命中型態'
+
+        st.markdown(f"""
+        <div style="
+            background:linear-gradient(135deg,#1a1a2e,#16213e);
+            border-radius:16px;padding:20px;
+            border:2px solid {border_c};height:100%;
+        ">
+            <div style="font-size:13px;color:#aaa;margin-bottom:8px;">📍 K線結構判斷</div>
+            <div style="font-size:22px;font-weight:700;color:{border_c};margin-bottom:12px;">
+                {kline_result['action_label']}
+            </div>
+            <div style="font-size:13px;color:#ddd;margin-bottom:6px;">
+                目前位置：<b>{position}</b>　最新K線：<b>{k_type}</b>
+            </div>
+            <div style="font-size:13px;color:#a29bfe;border-top:1px solid #333;padding-top:8px;">
+                命中型態：{pattern_str}
+            </div>
+        </div>
+        """, unsafe_allow_html=True)
+
+    st.markdown("<div style='margin-top:16px;'></div>", unsafe_allow_html=True)
+
+    # ── 6 項細項評分（每排3格）──
+    status_emoji = {'green': '🟢', 'yellow': '🟡', 'red': '🔴'}
+    for row_start in range(0, len(items), 3):
+        cols = st.columns(3)
+        for i, col in enumerate(cols):
+            idx = row_start + i
+            if idx < len(items):
+                itm = items[idx]
+                with col:
+                    st.metric(
+                        label=f"{status_emoji[itm['status']]} {itm['name']}",
+                        value=f"{itm['score']:.0f} / {itm['max']:.0f}",
+                        delta=itm['desc'],
+                        delta_color='normal'
+                    )
+
+    with st.expander("📖 評分規則說明（K線型態分析系統）", expanded=False):
+        st.markdown("""
+**系統核心理念**（來源：朱家泓《多空操作秘笈》第3章）
+
+| 項目 | 滿分 | 核心判斷邏輯 |
+|---|---|---|
+| 單根K線變盤訊號 | 15 | 高檔出現墓碑線/十字線/倒槌/長黑＝看跌；低檔出現長T線/十字線/槌子/長紅＝看漲 |
+| 兩根K線反轉組合 | 20 | 覆蓋(烏雲罩頂)／貫穿／吞噬／母子懷抱，依高低檔位置判斷多空意義 |
+| 晨星/夜星型態 | 15 | 三根K線組合：低檔晨星＝強力止跌；高檔夜星＝強力反轉向下 |
+| 連續K線型態 | 15 | 上升三法/下降三法為中繼；連3紅/連3黑為動能訊號 |
+| 大量紅黑K位置判讀 | 20 | 高檔大量長紅K不能買（主力出貨）；低檔大量長紅K可買（空轉多） |
+| 趨勢軌道位置 | 15 | 股價相對近期高低點的壓力支撐位置，突破/跌破即時加減分 |
+
+**判斷邏輯**：
+- 🟢 **≥ 75分**：K線結構強多頭，型態與位置同時偏多
+- 🟢 **60–74分**：K線結構偏多
+- 🟡 **40–59分**：K線結構中性，無明顯方向
+- 🟠 **25–39分**：K線結構偏空
+- 🔴 **< 25分**：K線結構強空頭，留意風險
+
+⚠️ 本系統為型態統計判斷，僅供參考，不構成投資建議。型態訊號需搭配成交量與趨勢確認。
+        """)
+
+
 # ─────────────────────────────────────────────
 # 圖表函數
 # ─────────────────────────────────────────────
 
 def create_candlestick_chart(df, symbol, rsi_period, currency_symbol,
+
                               institutional_df=None, market='us', selected_mas=None):
     """
     v3 主K線多層圖：K線+BB+可切換MA / RSI / OBV / 成交量 / 三大法人（台股）
@@ -3523,7 +4099,7 @@ def create_oscillator_chart(df, symbol):
 
 
 def generate_stock_evaluation(symbol, stock_data, openai_api_key, market='us',
-                               zhu_result=None, bull_signals=None, rsi_period=14,
+                               zhu_result=None, bull_signals=None, kline_result=None, rsi_period=14,
                                institutional_df=None, margin_df=None,
                                weekly_df=None, financial_data=None,
                                analyst_data=None, insider_df=None, director_df=None):
@@ -3640,6 +4216,12 @@ def generate_stock_evaluation(symbol, stock_data, openai_api_key, market='us',
             zhu_str = f"朱家泓評分：{zhu_result['score']}/100（{zhu_result['action_label']}），趨勢：{zhu_result['trend']}"
             if zhu_result.get('transition'): zhu_str += f"，{zhu_result['transition']}"
         bull_str = f"多頭訊號：{bull_signals['total_score']:.0f}/100 — {bull_signals['conclusion']}" if bull_signals else ""
+        kline_str = ""
+        if kline_result:
+            kline_str = (f"K線型態評分：{kline_result['score']}/100（{kline_result['action_label']}），"
+                         f"位置：{kline_result['position_context']}，最新K線：{kline_result['latest_kline_type']}")
+            if kline_result.get('patterns_found'):
+                kline_str += f"，命中型態：{'、'.join(kline_result['patterns_found'])}"
 
         # ── 輔助函式：安全格式化 ──
         def _f(v, fmt=".2f"): return format(v, fmt) if v is not None else "N/A"
@@ -3698,6 +4280,7 @@ def generate_stock_evaluation(symbol, stock_data, openai_api_key, market='us',
             lines_list += ["", "【三大法人（台股）】"] + inst_lines
         if zhu_str:  lines_list += ["", zhu_str]
         if bull_str: lines_list.append(bull_str)
+        if kline_str: lines_list.append(kline_str)
 
         data_block = "\n".join(lines_list)
 
@@ -3798,7 +4381,7 @@ def generate_stock_evaluation(symbol, stock_data, openai_api_key, market='us',
 
 
 def generate_investment_advice(symbol, stock_data, openai_api_key, market='us', zhu_result=None,
-                                bull_signals=None, rsi_period=14,
+                                bull_signals=None, kline_result=None, rsi_period=14,
                                 institutional_df=None, margin_df=None,
                                 financial_data=None, analyst_data=None,
                                 insider_df=None, director_df=None):
@@ -3896,6 +4479,15 @@ def generate_investment_advice(symbol, stock_data, openai_api_key, market='us', 
                 summary_lines.append(f"趨勢轉換偵測：{zhu_result['transition']}")
             if zhu_result.get('consolidation_breakout'):
                 summary_lines.append("盤整突破訊號：已確認")
+
+        # K線型態分析系統摘要
+        if kline_result:
+            summary_lines.append(
+                f"K線型態評分：{kline_result['score']}/100 — {kline_result['action_label']}"
+                f"（位置：{kline_result['position_context']}，最新K線：{kline_result['latest_kline_type']}）"
+            )
+            if kline_result.get('patterns_found'):
+                summary_lines.append(f"K線命中型態：{'、'.join(kline_result['patterns_found'])}")
 
         # 台股籌碼附加
         if market == 'tw':
@@ -4026,7 +4618,7 @@ def generate_investment_advice(symbol, stock_data, openai_api_key, market='us', 
 def generate_ai_insights(symbol, stock_data, openai_api_key, start_date, end_date,
                           market='us', margin_df=None, institutional_df=None,
                           financial_data=None, rsi_period=14, bull_signals=None,
-                          insider_df=None, analyst_data=None,
+                          kline_result=None, insider_df=None, analyst_data=None,
                           weekly_df=None, director_df=None):
     try:
         client = OpenAI(api_key=openai_api_key)
@@ -4221,6 +4813,20 @@ def generate_ai_insights(symbol, stock_data, openai_api_key, start_date, end_dat
                 for s in bull_signals['signals']
             ])
             user_prompt += f"\n### 多頭訊號評分結果（整體{bull_signals['total_score']:.0f}/100分，共{len(bull_signals['signals'])}項）\n{signal_summary}\n結論：{bull_signals['conclusion']}\n"
+
+        # K線型態分析系統
+        if kline_result:
+            kline_items_summary = "\n".join([
+                f"- {it['name']}：{'🟢' if it['status']=='green' else ('🟡' if it['status']=='yellow' else '🔴')} {it['desc']}（{it['score']:.0f}/{it['max']:.0f}分）"
+                for it in kline_result['items']
+            ])
+            kline_patterns_str = '、'.join(kline_result['patterns_found']) if kline_result['patterns_found'] else '無'
+            user_prompt += (
+                f"\n### K線型態分析系統（朱家泓《多空操作秘笈》第3章，整體{kline_result['score']}/100分）\n"
+                f"{kline_items_summary}\n"
+                f"目前位置：{kline_result['position_context']}　最新K線型態：{kline_result['latest_kline_type']}　"
+                f"命中型態：{kline_patterns_str}\n判斷：{kline_result['action_label']}\n"
+            )
 
         # 分析架構
         conclusion_extra = """
@@ -4607,6 +5213,7 @@ if analyze_button:
                 # ── Step 5: 計算多頭訊號 ──
                 bull_signals = calculate_bull_signals(data_with_indicators)
                 zhu_result   = calculate_zhu_trend_system(data_with_indicators)
+                kline_result = calculate_kline_pattern_system(data_with_indicators)
 
                 # ── Step 6: 籌碼/附加數據 ──
                 margin_df        = None
@@ -5494,6 +6101,12 @@ if analyze_button:
                         currency_symbol=currency_symbol
                     )
 
+                    # ── 顯示 11b：K線型態分析系統 ──
+                    display_kline_pattern_dashboard(
+                        kline_result,
+                        symbol.strip() if is_tw else symbol.upper()
+                    )
+
                     # ── 顯示 12：DMI 圖（含顏色索引）──
                     dmi_fig = create_dmi_chart(
                         data_with_indicators,
@@ -5562,6 +6175,7 @@ if analyze_button:
                             financial_data=financial_data,
                             rsi_period=rsi_period,
                             bull_signals=bull_signals,
+                            kline_result=kline_result,
                             insider_df=insider_df,
                             analyst_data=analyst_data,
                             weekly_df=weekly_df,
@@ -5598,6 +6212,7 @@ if analyze_button:
                             market=market_key,
                             bull_signals=bull_signals,
                             zhu_result=zhu_result,
+                            kline_result=kline_result,
                             rsi_period=rsi_period,
                             institutional_df=institutional_df if is_tw else None,
                             margin_df=margin_df if is_tw else None,
@@ -5629,6 +6244,7 @@ if analyze_button:
                             market=market_key,
                             zhu_result=zhu_result,
                             bull_signals=bull_signals,
+                            kline_result=kline_result,
                             rsi_period=rsi_period,
                             institutional_df=institutional_df if is_tw else None,
                             margin_df=margin_df if is_tw else None,
