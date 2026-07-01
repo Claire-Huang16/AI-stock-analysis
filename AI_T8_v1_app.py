@@ -2682,6 +2682,350 @@ def _detect_rising_falling_three_method(k_list):
     return None
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 朱家泓 12個操作口訣圖形練功系統
+# 來源：朱家泓《圖形口訣》第 11-3 章（21頁圖形範例）
+#
+# 口訣1：多頭大量不漲，股價要回檔（當日或後數日）
+# 口訣2：空頭大量不跌，股價要反彈（當日或後數日）
+# 口訣3：利多不漲＝空頭；利空不跌＝多頭
+# 口訣4：空頭利空不跌，主力進場築底
+# 口訣5：多頭該回不回，過高要大漲
+# 口訣6：空頭該彈不彈，破低要大跌
+# 口訣7：多頭完成反轉，要大跌
+# 口訣8：空頭完成反轉，會大漲
+# 口訣9：晨星多方主控，夜星空方主控；晨星對夜星，強多對強空
+# 口訣10：一星二陽長紅跌破，近日易大跌；一星二陰長黑突破，近日易大漲
+# 口訣11：大量不漲關前爆量（壓力前大量不漲＝多力衰竭）
+# 口訣12：上漲高檔久盤必跌，下跌低檔久盤必漲
+# ─────────────────────────────────────────────────────────────────────────────
+
+def calculate_zhu_mnemonics(df):
+    """
+    依朱家泓 12 個操作口訣進行量化辨識，回傳觸發的口訣列表與整體研判。
+
+    回傳 dict：
+      triggered       : list[dict]  已觸發的口訣（含編號/名稱/說明/方向/強度）
+      bull_signals    : list[str]   多頭口訣簡述
+      bear_signals    : list[str]   空頭口訣簡述
+      net_score       : int         正值偏多，負值偏空（每個口訣 +1 多 / -1 空）
+      summary         : str         整體研判文字
+      detail          : dict        各項原始計算值供 GPT 參考
+    """
+    result = {
+        'triggered': [],
+        'bull_signals': [],
+        'bear_signals': [],
+        'net_score': 0,
+        'summary': '',
+        'detail': {},
+    }
+
+    if df is None or len(df) < 10:
+        result['summary'] = '資料不足，無法進行口訣辨識'
+        return result
+
+    n = len(df)
+    closes  = df['close'].values.astype(float)
+    opens   = df['open'].values.astype(float)
+    highs   = df['high'].values.astype(float)
+    lows    = df['low'].values.astype(float)
+    volumes = df['volume'].values.astype(float) if 'volume' in df.columns else None
+
+    c0, o0, h0, l0 = closes[-1], opens[-1], highs[-1], lows[-1]
+    c1, o1, h1 = closes[-2], opens[-2], highs[-2]
+    c2, o2 = (closes[-3], opens[-3]) if n >= 3 else (c1, o1)
+
+    # 均線
+    def sma(arr, p): return float(arr[-p:].mean()) if len(arr) >= p else None
+    ma5  = sma(closes, 5)
+    ma10 = sma(closes, 10)
+    ma20 = sma(closes, 20)
+    ma60 = sma(closes, 60) if n >= 60 else None
+
+    # 近期高低點（20日）
+    look = min(20, n - 1)
+    rh = float(highs[-look-1:-1].max()) if look > 0 else h0
+    rl = float(lows[-look-1:-1].min())  if look > 0 else l0
+    rel_pos = (c0 - rl) / (rh - rl + 1e-9)
+
+    # 位置判斷
+    is_high = rel_pos >= 0.75
+    is_low  = rel_pos <= 0.25
+    in_uptrend   = (ma5 and ma20 and ma5 > ma20) if (ma5 and ma20) else False
+    in_downtrend = (ma5 and ma20 and ma5 < ma20) if (ma5 and ma20) else False
+
+    # 量相關
+    avg_vol = float(volumes[-20:].mean()) if volumes is not None and len(volumes) >= 5 else None
+    v0  = float(volumes[-1]) if volumes is not None else None
+    v1  = float(volumes[-2]) if volumes is not None and len(volumes) >= 2 else None
+    big_vol    = (v0 is not None and avg_vol and v0 > avg_vol * 1.5)
+    huge_vol   = (v0 is not None and avg_vol and v0 > avg_vol * 2.5)  # 爆量
+
+    # K線紅黑
+    is_red0   = c0 > o0   # 今日紅K（台股：紅=上漲）
+    is_black0 = c0 < o0
+    is_red1   = c1 > o1
+    is_black1 = c1 < o1
+    is_red2   = c2 > o2
+    is_black2 = c2 < o2
+
+    body0 = abs(c0 - o0)
+    rng0  = max(h0 - l0, 1e-9)
+    long_body0 = body0 / rng0 >= 0.5
+
+    body1 = abs(c1 - o1)
+    rng1  = max(h1 - l1 if False else highs[-2] - lows[-2], 1e-9)
+    long_body1 = body1 / rng1 >= 0.5
+
+    def add(num, name, direction, strength, desc):
+        entry = {'num': num, 'name': name, 'direction': direction,
+                 'strength': strength, 'desc': desc}
+        result['triggered'].append(entry)
+        if direction == 'bull':
+            result['bull_signals'].append(f"【口訣{num}】{desc}")
+            result['net_score'] += strength
+        else:
+            result['bear_signals'].append(f"【口訣{num}】{desc}")
+            result['net_score'] -= strength
+
+    # ──────────────────────────────────────────────────────────────────
+    # 口訣1：多頭大量不漲（高檔爆量黑K 或 量大收黑收平） → 回檔訊號
+    # ──────────────────────────────────────────────────────────────────
+    if in_uptrend and is_high and big_vol and (is_black0 or (not is_red0 and body0 / rng0 < 0.2)):
+        add(1, '多頭大量不漲', 'bear', 2,
+            f'多頭高檔爆量但收{"黑K" if is_black0 else "十字/紡錘"}，量大不漲 → 回檔風險高（量比≈{v0/avg_vol:.1f}x）')
+    elif in_uptrend and is_high and huge_vol and is_black0:
+        add(1, '多頭大量不漲', 'bear', 3,
+            f'多頭高檔爆天量黑K，強力回頭訊號，近期回檔機率高（量比≈{v0/avg_vol:.1f}x）')
+
+    # ──────────────────────────────────────────────────────────────────
+    # 口訣2：空頭大量不跌（低檔爆量紅K 或 量大收紅收平） → 反彈訊號
+    # ──────────────────────────────────────────────────────────────────
+    if in_downtrend and is_low and big_vol and (is_red0 or (not is_black0 and body0 / rng0 < 0.2)):
+        add(2, '空頭大量不跌', 'bull', 2,
+            f'空頭低檔爆量但收{"紅K" if is_red0 else "十字/紡錘"}，量大不跌 → 反彈訊號（量比≈{v0/avg_vol:.1f}x）')
+    elif in_downtrend and is_low and huge_vol and is_red0:
+        add(2, '空頭大量不跌', 'bull', 3,
+            f'空頭低檔爆天量長紅K，止跌反彈強力訊號（量比≈{v0/avg_vol:.1f}x）')
+
+    # ──────────────────────────────────────────────────────────────────
+    # 口訣5：多頭該回不回，過高要大漲
+    # 條件：上漲趨勢 + 均線多頭排列 + 近期回檔幅度小（< 3%）+ 收盤站上前高
+    # ──────────────────────────────────────────────────────────────────
+    if in_uptrend and ma5 and ma20 and ma5 > ma20:
+        pullback_5d = (max(closes[-5:]) - min(closes[-5:])) / (max(closes[-5:]) + 1e-9)
+        prev_high   = float(highs[-6:-1].max()) if n >= 6 else rh
+        if pullback_5d < 0.05 and c0 > prev_high:
+            add(5, '多頭該回不回過高大漲', 'bull', 2,
+                f'多頭走勢近5日回檔幅度僅{pullback_5d*100:.1f}%，今日收盤{c0:.2f}突破前高{prev_high:.2f}，口訣5：過高要大漲')
+
+    # ──────────────────────────────────────────────────────────────────
+    # 口訣6：空頭該彈不彈，破低要大跌
+    # ──────────────────────────────────────────────────────────────────
+    if in_downtrend and ma5 and ma20 and ma5 < ma20:
+        bounce_5d = (max(closes[-5:]) - min(closes[-5:])) / (min(closes[-5:]) + 1e-9)
+        prev_low  = float(lows[-6:-1].min()) if n >= 6 else rl
+        if bounce_5d < 0.05 and c0 < prev_low:
+            add(6, '空頭該彈不彈破低大跌', 'bear', 2,
+                f'空頭走勢近5日反彈幅度僅{bounce_5d*100:.1f}%，今日收盤{c0:.2f}跌破前低{prev_low:.2f}，口訣6：破低要大跌')
+
+    # ──────────────────────────────────────────────────────────────────
+    # 口訣7：多頭完成反轉，要大跌
+    # 訊號：高檔出現多頭確認後空頭確認（均線由多排翻空排 + 跌破重要均線）
+    # ──────────────────────────────────────────────────────────────────
+    if ma5 and ma10 and ma20:
+        was_bull = is_high  # 高檔位置代表曾是多頭
+        now_bear = ma5 < ma10 < ma20  # 均線翻空排
+        broke_ma20 = c0 < ma20
+        if was_bull and now_bear and broke_ma20:
+            add(7, '多頭完成反轉要大跌', 'bear', 3,
+                f'高檔均線由多頭排列轉空頭（MA5{ma5:.2f}<MA10{ma10:.2f}<MA20{ma20:.2f}），收盤{c0:.2f}跌破MA20，口訣7：要大跌')
+
+    # ──────────────────────────────────────────────────────────────────
+    # 口訣8：空頭完成反轉，會大漲
+    # ──────────────────────────────────────────────────────────────────
+    if ma5 and ma10 and ma20:
+        was_bear = is_low   # 低檔位置代表曾是空頭
+        now_bull = ma5 > ma10 > ma20
+        above_ma20 = c0 > ma20
+        if was_bear and now_bull and above_ma20:
+            add(8, '空頭完成反轉會大漲', 'bull', 3,
+                f'低檔均線由空頭排列轉多頭（MA5{ma5:.2f}>MA10{ma10:.2f}>MA20{ma20:.2f}），收盤{c0:.2f}突破MA20，口訣8：會大漲')
+
+    # ──────────────────────────────────────────────────────────────────
+    # 口訣9：晨星多方主控 / 夜星空方主控
+    # 晨星對夜星（強多對強空），看誰出現在更接近現在
+    # ──────────────────────────────────────────────────────────────────
+    if n >= 3:
+        # 夜星：長紅 + 跳空小實體（變盤）+ 長黑收過前紅中點以下
+        h2 = float(highs[-3]) if n >= 3 else h0
+        l2 = float(lows[-3])  if n >= 3 else l0
+        k1_rng = max(h2 - l2, 1e-9)
+        k1r = c2 > o2 and (abs(c2 - o2) / k1_rng) >= 0.4
+        k2_small = (body1/(max(highs[-2],lows[-2])-min(highs[-2],lows[-2])+1e-9)) <= 0.35
+        midK1 = (max(c2,o2) + min(c2,o2)) / 2
+        evening_star = k1r and k2_small and is_black0 and c0 < midK1 and is_high
+        # 晨星：長黑 + 小實體 + 長紅收過前黑中點以上
+        k1_bear = c2 < o2 and (abs(c2-o2)/(max(highs[-3],lows[-3])-min(highs[-3],lows[-3])+1e-9))>=0.4
+        morning_star = k1_bear and k2_small and is_red0 and c0 > midK1 and is_low
+        if evening_star:
+            add(9, '夜星空方主控', 'bear', 3,
+                f'高檔出現「夜星」K線組合（長紅→小實體→長黑收破中點），口訣9：夜星空方主控，強力轉折向下')
+        if morning_star:
+            add(9, '晨星多方主控', 'bull', 3,
+                f'低檔出現「晨星」K線組合（長黑→小實體→長紅收過中點），口訣9：晨星多方主控，強力轉折向上')
+
+    # ──────────────────────────────────────────────────────────────────
+    # 口訣10：一星二陽長紅跌破＝大跌 / 一星二陰長黑突破＝大漲
+    # 一星＝十字/小實體，二陽/二陰＝前兩根同向K線
+    # ──────────────────────────────────────────────────────────────────
+    if n >= 4:
+        k3r = closes[-4] > opens[-4]  # 第4根（舊）
+        k2r_cur = is_red2             # 第3根
+        k1_doji = (abs(c1-o1)/(max(highs[-2],lows[-2])-min(highs[-2],lows[-2])+1e-9)) <= 0.25  # 一星
+        # 一星二陽 + 今日長黑跌破前高（夜星延伸版）
+        if k3r and k2r_cur and k1_doji and is_black0 and long_body0 and c0 < min(o1,c1) and is_high:
+            add(10, '一星二陽長紅跌破大跌', 'bear', 3,
+                f'高檔「一星二陽」後今日長黑跌破星K低點，口訣10：近日易大跌')
+        # 一星二陰 + 今日長紅突破前低（晨星延伸版）
+        k3b = closes[-4] < opens[-4]
+        k2b_cur = is_black2
+        if k3b and k2b_cur and k1_doji and is_red0 and long_body0 and c0 > max(o1,c1) and is_low:
+            add(10, '一星二陰長黑突破大漲', 'bull', 3,
+                f'低檔「一星二陰」後今日長紅突破星K高點，口訣10：近日易大漲')
+
+    # ──────────────────────────────────────────────────────────────────
+    # 口訣11：大量不漲關前爆量（接近壓力位置時量大卻不突破＝多力衰竭）
+    # ──────────────────────────────────────────────────────────────────
+    if avg_vol and v0:
+        dist_to_high = (rh - c0) / c0 * 100
+        near_resistance = 0 <= dist_to_high <= 5   # 接近近期高點壓力（5%以內）
+        # 關前爆量不漲：接近壓力位 + 爆量 + 今日收黑或量大但未突破
+        if near_resistance and big_vol and (is_black0 or c0 < h0 * 0.98):
+            add(11, '關前爆量大量不漲', 'bear', 2,
+                f'接近壓力位({rh:.2f}，距{dist_to_high:.1f}%)，量比{v0/avg_vol:.1f}x爆量卻{"收黑" if is_black0 else "未突破高點"}，口訣11：多方衰竭')
+        # 反向：接近支撐位爆量不跌（口訣11反面 = 口訣2的位置版）
+        dist_to_low = (c0 - rl) / c0 * 100
+        near_support = 0 <= dist_to_low <= 5
+        if near_support and big_vol and (is_red0 or c0 > l0 * 1.02):
+            add(11, '關前爆量大量不跌', 'bull', 2,
+                f'接近支撐位({rl:.2f}，距{dist_to_low:.1f}%)，量比{v0/avg_vol:.1f}x爆量卻{"收紅" if is_red0 else "未跌破低點"}，口訣11反面：空方衰竭')
+
+    # ──────────────────────────────────────────────────────────────────
+    # 口訣12：上漲高檔久盤必跌，下跌低檔久盤必漲
+    # 久盤：近10日BBW極度壓縮（窄幅整理）且位置偏高或偏低
+    # ──────────────────────────────────────────────────────────────────
+    if n >= 15 and 'BB_Width' in df.columns:
+        recent_bbw = float(df['BB_Width'].iloc[-1])
+        bbw_5d_avg = float(df['BB_Width'].tail(5).mean())
+        if bbw_5d_avg < 0.08:   # 極度壓縮閾值
+            if is_high and big_vol and is_black0:
+                add(12, '高檔久盤跌破必跌', 'bear', 3,
+                    f'高檔BBW={bbw_5d_avg:.3f}（極度壓縮），今日爆量收黑，口訣12：高檔久盤跌破必跌')
+            elif is_low and big_vol and is_red0:
+                add(12, '低檔久盤突破必漲', 'bull', 3,
+                    f'低檔BBW={bbw_5d_avg:.3f}（極度壓縮），今日爆量收紅，口訣12：低檔久盤突破必漲')
+            elif is_high:
+                add(12, '高檔久盤留意跌破', 'bear', 1,
+                    f'高檔BBW={bbw_5d_avg:.3f}（極度壓縮），盤整中，口訣12：上漲高檔久盤必跌，留意跌破時機')
+            elif is_low:
+                add(12, '低檔久盤留意突破', 'bull', 1,
+                    f'低檔BBW={bbw_5d_avg:.3f}（極度壓縮），盤整中，口訣12：下跌低檔久盤必漲，留意突破時機')
+
+    # ── 補充：口訣3/4（利多不漲 / 利空不跌）無法從純技術面量化，留給 GPT 解讀 ──
+    # 口訣3/4 需要結合新聞面/基本面，在 GPT prompt 中提示 AI 注意
+
+    # ── 彙整 summary ──
+    nb = len(result['bull_signals'])
+    ns = len(result['bear_signals'])
+    score = result['net_score']
+
+    if score >= 4:
+        result['summary'] = f'⚡ 口訣研判：強多頭訊號（{nb}個多頭口訣觸發，淨分{score:+d}）'
+    elif score >= 2:
+        result['summary'] = f'📈 口訣研判：偏多（{nb}個多頭口訣觸發，淨分{score:+d}）'
+    elif score <= -4:
+        result['summary'] = f'⚡ 口訣研判：強空頭訊號（{ns}個空頭口訣觸發，淨分{score:+d}）'
+    elif score <= -2:
+        result['summary'] = f'📉 口訣研判：偏空（{ns}個空頭口訣觸發，淨分{score:+d}）'
+    elif nb == 0 and ns == 0:
+        result['summary'] = '⚪ 口訣研判：目前無明顯口訣訊號，繼續觀察'
+    else:
+        result['summary'] = f'⚖️ 口訣研判：多空交錯（多{nb}空{ns}，淨分{score:+d}），方向待確認'
+
+    result['detail'] = {
+        'rel_pos': round(rel_pos, 2), 'is_high': is_high, 'is_low': is_low,
+        'in_uptrend': in_uptrend, 'in_downtrend': in_downtrend,
+        'vol_ratio': round(v0 / avg_vol, 2) if (v0 and avg_vol) else None,
+        'big_vol': big_vol, 'huge_vol': huge_vol,
+    }
+    return result
+
+
+def display_zhu_mnemonics_dashboard(mnemonics_result, symbol):
+    """顯示朱家泓12口訣觸發結果儀表板"""
+    triggered = mnemonics_result.get('triggered', [])
+    summary   = mnemonics_result.get('summary', '')
+    bull_sigs = mnemonics_result.get('bull_signals', [])
+    bear_sigs = mnemonics_result.get('bear_signals', [])
+    score     = mnemonics_result.get('net_score', 0)
+
+    st.markdown("---")
+    st.markdown("### 📖 朱家泓 12個操作口訣辨識")
+    st.caption("來源：朱家泓《圖形口訣》第11-3章 — 量化辨識多空操作口訣觸發訊號")
+
+    if not triggered:
+        st.info(f"⚪ 目前無明顯口訣訊號觸發，繼續觀察趨勢發展。\n\n"
+                f"> 口訣3（利多不漲/利空不跌）及更多背景判斷，請參考 AI 投資建議的口訣分析段落。")
+        return
+
+    # 整體研判橫幅
+    banner_color = '#2ed573' if score > 0 else ('#ff4757' if score < 0 else '#f9ca24')
+    st.markdown(f"""
+<div style="background:linear-gradient(135deg,#1a1a2e,#16213e);
+  border:2px solid {banner_color};border-radius:12px;padding:14px 20px;margin-bottom:16px;">
+  <span style="font-size:17px;font-weight:700;color:{banner_color};">{summary}</span>
+</div>""", unsafe_allow_html=True)
+
+    # 已觸發的口訣卡片
+    col_bull, col_bear = st.columns(2)
+    with col_bull:
+        if bull_sigs:
+            st.markdown("**🟢 多頭口訣訊號**")
+            for s in bull_sigs:
+                st.success(s)
+        else:
+            st.caption("🟢 無多頭口訣訊號")
+    with col_bear:
+        if bear_sigs:
+            st.markdown("**🔴 空頭口訣訊號**")
+            for s in bear_sigs:
+                st.error(s)
+        else:
+            st.caption("🔴 無空頭口訣訊號")
+
+    with st.expander("📋 朱家泓12口訣快速參考", expanded=False):
+        st.markdown("""
+| # | 口訣 | 多空 |
+|---|------|------|
+| 1 | **多頭大量不漲**，股價要回檔（當日或後數日） | 🔴 空 |
+| 2 | **空頭大量不跌**，股價要反彈（當日或後數日） | 🟢 多 |
+| 3 | 利多不漲＝空頭；**利空不跌＝多頭** | 情境判斷 |
+| 4 | **空頭利空不跌**，主力進場築底 | 🟢 多 |
+| 5 | 多頭**該回不回**，過高要大漲 | 🟢 多 |
+| 6 | 空頭**該彈不彈**，破低要大跌 | 🔴 空 |
+| 7 | **多頭完成反轉**，要大跌 | 🔴 空 |
+| 8 | **空頭完成反轉**，會大漲 | 🟢 多 |
+| 9 | **晨星多方主控**，夜星空方主控；晨星對夜星，強多對強空 | 情境判斷 |
+| 10 | 一星二陽長紅跌破近日易大跌；**一星二陰長黑突破近日易大漲** | 情境判斷 |
+| 11 | **大量不漲**，關前爆量（壓力前爆量不漲＝多力衰竭） | 🔴 空 |
+| 12 | 上漲**高檔久盤必跌**；下跌**低檔久盤必漲** | 情境判斷 |
+
+> ⚠️ 口訣為趨勢觀察工具，需搭配整體走勢與成交量確認，不構成投資建議。
+        """)
+
+
 def calculate_kline_pattern_system(df):
     """
     朱家泓 K線型態分析系統 — 產生 0–100 分的K線結構評分。
@@ -4099,7 +4443,8 @@ def create_oscillator_chart(df, symbol):
 
 
 def generate_stock_evaluation(symbol, stock_data, openai_api_key, market='us',
-                               zhu_result=None, bull_signals=None, kline_result=None, rsi_period=14,
+                               zhu_result=None, bull_signals=None, kline_result=None,
+                               mnemonics_result=None, rsi_period=14,
                                institutional_df=None, margin_df=None,
                                weekly_df=None, financial_data=None,
                                analyst_data=None, insider_df=None, director_df=None):
@@ -4281,6 +4626,13 @@ def generate_stock_evaluation(symbol, stock_data, openai_api_key, market='us',
         if zhu_str:  lines_list += ["", zhu_str]
         if bull_str: lines_list.append(bull_str)
         if kline_str: lines_list.append(kline_str)
+        if mnemonics_result and mnemonics_result.get('triggered'):
+            m_summary = mnemonics_result.get('summary', '')
+            m_bull = '、'.join([f"口訣{t['num']}" for t in mnemonics_result['triggered'] if t['direction']=='bull'])
+            m_bear = '、'.join([f"口訣{t['num']}" for t in mnemonics_result['triggered'] if t['direction']=='bear'])
+            lines_list.append(f"\n【朱家泓12口訣辨識】{m_summary}")
+            if m_bull: lines_list.append(f"  多頭口訣：{m_bull} — " + "；".join(mnemonics_result['bull_signals']))
+            if m_bear: lines_list.append(f"  空頭口訣：{m_bear} — " + "；".join(mnemonics_result['bear_signals']))
 
         data_block = "\n".join(lines_list)
 
@@ -4381,7 +4733,8 @@ def generate_stock_evaluation(symbol, stock_data, openai_api_key, market='us',
 
 
 def generate_investment_advice(symbol, stock_data, openai_api_key, market='us', zhu_result=None,
-                                bull_signals=None, kline_result=None, rsi_period=14,
+                                bull_signals=None, kline_result=None, mnemonics_result=None,
+                                rsi_period=14,
                                 institutional_df=None, margin_df=None,
                                 financial_data=None, analyst_data=None,
                                 insider_df=None, director_df=None):
@@ -4489,6 +4842,16 @@ def generate_investment_advice(symbol, stock_data, openai_api_key, market='us', 
             if kline_result.get('patterns_found'):
                 summary_lines.append(f"K線命中型態：{'、'.join(kline_result['patterns_found'])}")
 
+        # 朱家泓12口訣辨識摘要
+        if mnemonics_result and mnemonics_result.get('triggered'):
+            summary_lines.append(f"\n【朱家泓12口訣圖形辨識】{mnemonics_result.get('summary','')}")
+            for t in mnemonics_result['triggered']:
+                dir_tag = '🟢多頭' if t['direction']=='bull' else '🔴空頭'
+                summary_lines.append(f"  {dir_tag} 口訣{t['num']}《{t['name']}》：{t['desc']}")
+            summary_lines.append(
+                "  ※ 口訣3（利多不漲/利空不跌）及口訣4（空頭利空不跌）需結合基本面/消息面由AI研判"
+            )
+
         # 台股籌碼附加
         if market == 'tw':
             if institutional_df is not None and len(institutional_df) > 0:
@@ -4529,11 +4892,14 @@ def generate_investment_advice(symbol, stock_data, openai_api_key, market='us', 
         data_summary = "\n".join(summary_lines)
 
         system_msg = """你是一位資深股票分析師，擅長整合技術面、籌碼面與基本面，給出具體、結構化的投資建議。
+你熟悉朱家泓《多空操作秘笈》的12個操作口訣（圖形口訣），會在建議中引用觸發的口訣名稱加強論據。
 
 重要規則：
 - 使用繁體中文
 - 只輸出格式化的投資建議，不要重複前面已有的技術分析
 - 建議必須包含具體的觀察依據（例如：RSI數值、均線位置、法人動向）
+- 如果數據中有朱家泓口訣觸發記錄，需在「主要依據」段落引用相關口訣（例如：「觸發口訣1：多頭大量不漲，股價回檔機率高」）
+- 口訣3（利多不漲/利空不跌）與口訣4（空頭利空不跌）需結合消息面/基本面由你主動研判是否適用
 - 嚴禁「保證獲利」等不當用語；須加上「以上為技術面分析參考，非投資建議，投資有風險」免責聲明
 - 輸出格式嚴格按照下方範本
 """
@@ -4561,7 +4927,7 @@ def generate_investment_advice(symbol, stock_data, openai_api_key, market='us', 
 - 停損：（具體數值或條件）
 - 停利：（具體數值或條件）
 
-**主要依據**：（2–3句說明，引用RSI/MACD/布林通道/成交量等具體數值）
+**主要依據**：（2–3句說明，引用RSI/MACD/布林通道/成交量等具體數值；若有口訣觸發請引用口訣名稱）
 
 ---
 
@@ -4580,6 +4946,12 @@ def generate_investment_advice(symbol, stock_data, openai_api_key, market='us', 
 - （指標3）
 
 **主要依據**：（3–4句說明，整合技術面、籌碼面、基本面）
+
+---
+
+### 📖 朱家泓口訣研判
+
+（根據觸發的口訣，說明目前圖形形態的操作意義；若無口訣觸發請說明目前圖形尚不符合任何口訣條件，建議繼續觀察。請特別評估口訣3/4是否適用於當前消息面環境。）
 
 ---
 
@@ -4618,7 +4990,8 @@ def generate_investment_advice(symbol, stock_data, openai_api_key, market='us', 
 def generate_ai_insights(symbol, stock_data, openai_api_key, start_date, end_date,
                           market='us', margin_df=None, institutional_df=None,
                           financial_data=None, rsi_period=14, bull_signals=None,
-                          kline_result=None, insider_df=None, analyst_data=None,
+                          kline_result=None, mnemonics_result=None,
+                          insider_df=None, analyst_data=None,
                           weekly_df=None, director_df=None):
     try:
         client = OpenAI(api_key=openai_api_key)
@@ -4828,6 +5201,23 @@ def generate_ai_insights(symbol, stock_data, openai_api_key, start_date, end_dat
                 f"命中型態：{kline_patterns_str}\n判斷：{kline_result['action_label']}\n"
             )
 
+        # 朱家泓12口訣辨識結果
+        if mnemonics_result and mnemonics_result.get('triggered'):
+            mne_lines = [f"\n### 朱家泓12個操作口訣辨識（圖形口訣第11-3章）"]
+            mne_lines.append(f"整體研判：{mnemonics_result.get('summary', '')}")
+            for t in mnemonics_result['triggered']:
+                dir_tag = '🟢多頭' if t['direction'] == 'bull' else '🔴空頭'
+                mne_lines.append(
+                    f"  {dir_tag} 口訣{t['num']}《{t['name']}》（強度{t['strength']}）：{t['desc']}"
+                )
+            mne_lines.append(
+                "  ※ 請在分析中引用以上觸發口訣，並評估口訣3（利多不漲/利空不跌）"
+                "與口訣4（空頭利空不跌）是否適用於當前消息面環境。"
+            )
+            user_prompt += "\n".join(mne_lines) + "\n"
+        elif mnemonics_result:
+            user_prompt += "\n### 朱家泓12口訣：目前無明顯口訣訊號觸發，建議繼續觀察。\n"
+
         # 分析架構
         conclusion_extra = """
 
@@ -4925,6 +5315,14 @@ def generate_ai_insights(symbol, stock_data, openai_api_key, start_date, end_dat
 - 壓縮期後突破方向的歷史統計（向上突破 vs 向下突破比例）
 - 股價穿越中軌（BB_MID）的方向與持續性
 - 上下軌觸碰次數與回歸中軌的歷史規律
+
+#### 8d. 朱家泓12口訣圖形研判（必要）
+依據《圖形口訣》第11-3章，結合上方提供的口訣辨識結果，進行以下研判：
+
+**已觸發口訣**：引用並解釋所有觸發口訣的操作意涵與注意事項（若有，若無請說明目前無口訣觸發，處於醞釀觀察階段）
+**口訣3評估**（利多不漲/利空不跌）：從當前消息面與技術面，研判是否存在「利多出現但股價不漲」或「利空出現但股價不跌」的情況，並解釋多空意義
+**口訣4評估**（空頭利空不跌）：評估是否有主力在空頭中逆勢進場築底的跡象
+**整體口訣結論**：根據觸發情況，說明目前圖形在朱家泓口訣體系中屬於哪個階段，以及相應的操作建議
 
 #### 10. 內部人買賣分析（必要；台股顯示GoodInfo查詢連結說明）
 - 近3個月董監事買賣動向、淨買超/賣超歷史意涵
@@ -5213,7 +5611,8 @@ if analyze_button:
                 # ── Step 5: 計算多頭訊號 ──
                 bull_signals = calculate_bull_signals(data_with_indicators)
                 zhu_result   = calculate_zhu_trend_system(data_with_indicators)
-                kline_result = calculate_kline_pattern_system(data_with_indicators)
+                kline_result    = calculate_kline_pattern_system(data_with_indicators)
+                mnemonics_result = calculate_zhu_mnemonics(data_with_indicators)
 
                 # ── Step 6: 籌碼/附加數據 ──
                 margin_df        = None
@@ -6107,6 +6506,12 @@ if analyze_button:
                         symbol.strip() if is_tw else symbol.upper()
                     )
 
+                    # ── 顯示 11c：朱家泓12口訣辨識 ──
+                    display_zhu_mnemonics_dashboard(
+                        mnemonics_result,
+                        symbol.strip() if is_tw else symbol.upper()
+                    )
+
                     # ── 顯示 12：DMI 圖（含顏色索引）──
                     dmi_fig = create_dmi_chart(
                         data_with_indicators,
@@ -6176,6 +6581,7 @@ if analyze_button:
                             rsi_period=rsi_period,
                             bull_signals=bull_signals,
                             kline_result=kline_result,
+                            mnemonics_result=mnemonics_result,
                             insider_df=insider_df,
                             analyst_data=analyst_data,
                             weekly_df=weekly_df,
@@ -6213,6 +6619,7 @@ if analyze_button:
                             bull_signals=bull_signals,
                             zhu_result=zhu_result,
                             kline_result=kline_result,
+                            mnemonics_result=mnemonics_result,
                             rsi_period=rsi_period,
                             institutional_df=institutional_df if is_tw else None,
                             margin_df=margin_df if is_tw else None,
@@ -6245,6 +6652,7 @@ if analyze_button:
                             zhu_result=zhu_result,
                             bull_signals=bull_signals,
                             kline_result=kline_result,
+                            mnemonics_result=mnemonics_result,
                             rsi_period=rsi_period,
                             institutional_df=institutional_df if is_tw else None,
                             margin_df=margin_df if is_tw else None,
