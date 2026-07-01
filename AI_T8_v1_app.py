@@ -3409,8 +3409,8 @@ def display_kline_pattern_dashboard(kline_result, symbol):
 # ─────────────────────────────────────────────
 
 def create_candlestick_chart(df, symbol, rsi_period, currency_symbol,
-
-                              institutional_df=None, market='us', selected_mas=None):
+                              institutional_df=None, market='us', selected_mas=None,
+                              sr_result=None):
     """
     v3 主K線多層圖：K線+BB+可切換MA / RSI / OBV / 成交量 / 三大法人（台股）
     美股5層，台股6層
@@ -3642,6 +3642,10 @@ def create_candlestick_chart(df, symbol, rsi_period, currency_symbol,
                 ), row=kd_row, col=1)
         fig.update_yaxes(range=[0, 100], row=kd_row, col=1)
 
+    # ── 朱家泓切線系統支撐壓力標注（Row 1）──────────────────────
+    if sr_result is not None:
+        fig = add_sr_traces_to_fig(fig, df, sr_result, row=1)
+
     # ── 佈局更新 ──
     fig.update_layout(
         title=f'{symbol} 主K線圖（含布林通道、MA、RSI、OBV、KD）',
@@ -3658,6 +3662,354 @@ def create_candlestick_chart(df, symbol, rsi_period, currency_symbol,
     if show_inst:
         fig.update_yaxes(title_text="買賣超（張）", row=5, col=1)
     fig.update_yaxes(title_text="KD", row=kd_row, col=1)
+
+    return fig
+
+
+# ─────────────────────────────────────────────────────────────────────────────
+# 朱家泓切線系統 — 支撐壓力自動計算與 Plotly 標注
+# 來源：朱家泓《切線》第5-6章（99頁）
+#   5-1 上升/下降切線（連接底底高/頭頭低）
+#   5-2 軌道線（趨勢通道）
+#   6-2 七大支撐壓力來源：
+#       ① 切線支撐/壓力  ② 水平轉折高低點
+#       ③ 盤整區         ④ 跳空缺口
+#       ⑤ 大量長紅/黑K   ⑥ 均線 MA20/60
+#       ⑦ 二分之一價
+# ─────────────────────────────────────────────────────────────────────────────
+
+def calculate_zhu_sr_levels(df: 'pd.DataFrame', pivot_window: int = 3) -> dict:
+    """
+    依朱家泓切線系統自動計算七大支撐壓力來源。
+    輸入 df 需含 open/high/low/close/volume 欄位（小寫）與 date 欄位。
+
+    回傳 dict：
+      trendlines   : list[dict]  切線（上升/下降）
+      channels     : list[dict]  軌道線（上下軌）
+      h_supports   : list[dict]  水平支撐（轉折低點）
+      h_resistances: list[dict]  水平壓力（轉折高點）
+      consolidations: list[dict] 盤整區（密集橫盤）
+      gaps         : list[dict]  跳空缺口
+      big_volume_k : list[dict]  大量長紅/黑K支撐壓力
+      half_price   : float       二分之一波段價
+      summary_text : str         摘要文字供 GPT 使用
+    """
+    import numpy as np
+
+    result = {
+        'trendlines': [], 'channels': [], 'h_supports': [], 'h_resistances': [],
+        'consolidations': [], 'gaps': [], 'big_volume_k': [],
+        'half_price': None, 'summary_text': '',
+    }
+
+    if df is None or len(df) < 15:
+        return result
+
+    closes  = df['close'].values.astype(float)
+    opens   = df['open'].values.astype(float)
+    highs   = df['high'].values.astype(float)
+    lows    = df['low'].values.astype(float)
+    volumes = df['volume'].values.astype(float) if 'volume' in df.columns else None
+    dates   = df['date'].values if 'date' in df.columns else list(range(len(df)))
+    n = len(df)
+
+    # ── ① 轉折高低點（pivot points）───────────────────────────────
+    w = pivot_window
+    pivot_highs, pivot_lows = [], []
+    for i in range(w, n - w):
+        h = highs[i]
+        if all(highs[j] <= h for j in range(i-w, i)) and all(highs[j] <= h for j in range(i+1, i+w+1)):
+            pivot_highs.append({'i': i, 'v': h, 'date': str(dates[i])[:10]})
+        l = lows[i]
+        if all(lows[j] >= l for j in range(i-w, i)) and all(lows[j] >= l for j in range(i+1, i+w+1)):
+            pivot_lows.append({'i': i, 'v': l, 'date': str(dates[i])[:10]})
+
+    # 取最近4個有效高低點作為水平支撐壓力
+    result['h_supports']   = pivot_lows[-4:]
+    result['h_resistances'] = pivot_highs[-4:]
+
+    # ── ② 切線 & 軌道線（上升/下降）──────────────────────────────
+    def fit_line(pts):
+        """線性回歸擬合趨勢線，回傳斜率、截距"""
+        if len(pts) < 2:
+            return None
+        xi = np.array([p['i'] for p in pts], dtype=float)
+        yi = np.array([p['v'] for p in pts], dtype=float)
+        if len(pts) == 2:
+            slope = (yi[1] - yi[0]) / (xi[1] - xi[0] + 1e-9)
+            intercept = yi[0] - slope * xi[0]
+        else:
+            mx, my = xi.mean(), yi.mean()
+            slope = ((xi - mx) * (yi - my)).sum() / ((xi - mx)**2).sum()
+            intercept = my - slope * mx
+        return {'slope': slope, 'intercept': intercept,
+                'pts': pts, 'i_start': int(xi[0]), 'i_end': int(xi[-1])}
+
+    # 上升切線：取最近2~3個有效低點中「底底高」的組合
+    valid_lows = [p for p in pivot_lows if p['i'] > n * 0.05]
+    if len(valid_lows) >= 2:
+        up_pts = valid_lows[-3:]  # 最近3個低點
+        up_tl = fit_line(up_pts)
+        if up_tl and up_tl['slope'] > 0:
+            # 計算延伸到最新
+            v_end = up_tl['slope'] * (n - 1) + up_tl['intercept']
+            result['trendlines'].append({
+                'type': 'up', 'label': '上升切線（支撐）',
+                'i_start': up_tl['i_start'], 'i_end': n - 1,
+                'v_start': up_tl['slope'] * up_tl['i_start'] + up_tl['intercept'],
+                'v_end': v_end, 'slope': up_tl['slope'],
+                'color': '#2ecc71', 'dash': 'solid', 'width': 2,
+                'current_value': round(float(v_end), 2),
+            })
+            # 軌道上軌：取切線段內各高點到切線最大偏離
+            channel_offsets = []
+            for i in range(up_tl['i_start'], min(up_tl['i_end'] + 1, n)):
+                tl_val = up_tl['slope'] * i + up_tl['intercept']
+                channel_offsets.append(highs[i] - tl_val)
+            if channel_offsets:
+                offset = max(channel_offsets) * 0.85
+                result['channels'].append({
+                    'type': 'up_upper', 'label': '上升軌道上軌（壓力）',
+                    'i_start': up_tl['i_start'], 'i_end': n - 1,
+                    'v_start': up_tl['slope'] * up_tl['i_start'] + up_tl['intercept'] + offset,
+                    'v_end': v_end + offset, 'color': '#2ecc71', 'dash': 'dot',
+                })
+
+    # 下降切線：取最近2~3個有效高點中「頭頭低」的組合
+    valid_highs = [p for p in pivot_highs if p['i'] > n * 0.05]
+    if len(valid_highs) >= 2:
+        dn_pts = valid_highs[-3:]
+        dn_tl = fit_line(dn_pts)
+        if dn_tl and dn_tl['slope'] < 0:
+            v_end = dn_tl['slope'] * (n - 1) + dn_tl['intercept']
+            result['trendlines'].append({
+                'type': 'dn', 'label': '下降切線（壓力）',
+                'i_start': dn_tl['i_start'], 'i_end': n - 1,
+                'v_start': dn_tl['slope'] * dn_tl['i_start'] + dn_tl['intercept'],
+                'v_end': v_end, 'slope': dn_tl['slope'],
+                'color': '#e74c3c', 'dash': 'solid', 'width': 2,
+                'current_value': round(float(v_end), 2),
+            })
+            channel_offsets = []
+            for i in range(dn_tl['i_start'], min(dn_tl['i_end'] + 1, n)):
+                tl_val = dn_tl['slope'] * i + dn_tl['intercept']
+                channel_offsets.append(tl_val - lows[i])
+            if channel_offsets:
+                offset = max(channel_offsets) * 0.85
+                result['channels'].append({
+                    'type': 'dn_lower', 'label': '下降軌道下軌（支撐）',
+                    'i_start': dn_tl['i_start'], 'i_end': n - 1,
+                    'v_start': dn_tl['slope'] * dn_tl['i_start'] + dn_tl['intercept'] - offset,
+                    'v_end': v_end - offset, 'color': '#e74c3c', 'dash': 'dot',
+                })
+
+    # ── ③ 盤整區（密集橫盤）─────────────────────────────────────
+    min_len, max_range = 5, 0.08
+    i = 0
+    while i < n - min_len:
+        lo = float(np.min(lows[i:i+min_len]))
+        hi = float(np.max(highs[i:i+min_len]))
+        if (hi - lo) / (lo + 1e-9) <= max_range:
+            j = i + min_len
+            while j < n and lows[j] >= lo * 0.99 and highs[j] <= hi * 1.01:
+                j += 1
+            if j - i >= min_len:
+                result['consolidations'].append({
+                    'i0': i, 'i1': j - 1,
+                    'lo': round(float(lo), 2), 'hi': round(float(hi), 2),
+                    'date_start': str(dates[i])[:10], 'date_end': str(dates[j-1])[:10],
+                    'label': f'盤整區 {lo:.2f}–{hi:.2f}',
+                })
+            i = j
+        else:
+            i += 1
+
+    # ── ④ 跳空缺口（min gap 0.5%）───────────────────────────────
+    min_gap_pct = 0.005
+    for i in range(1, n):
+        up_gap = lows[i] > highs[i-1] and (lows[i] - highs[i-1]) / (highs[i-1] + 1e-9) > min_gap_pct
+        dn_gap = highs[i] < lows[i-1] and (lows[i-1] - highs[i]) / (lows[i-1] + 1e-9) > min_gap_pct
+        if up_gap:
+            result['gaps'].append({
+                'i': i, 'type': 'up', 'lo': round(float(highs[i-1]), 2), 'hi': round(float(lows[i]), 2),
+                'date': str(dates[i])[:10], 'label': f'向上缺口支撐 {highs[i-1]:.2f}–{lows[i]:.2f}',
+            })
+        if dn_gap:
+            result['gaps'].append({
+                'i': i, 'type': 'dn', 'lo': round(float(highs[i]), 2), 'hi': round(float(lows[i-1]), 2),
+                'date': str(dates[i])[:10], 'label': f'向下缺口壓力 {highs[i]:.2f}–{lows[i-1]:.2f}',
+            })
+
+    # ── ⑤ 大量長紅/黑K支撐壓力 ─────────────────────────────────
+    if volumes is not None:
+        avg_vol = float(np.mean(volumes[-20:])) if n >= 20 else float(np.mean(volumes))
+        for i in range(n):
+            if volumes[i] > avg_vol * 1.8:
+                body = abs(closes[i] - opens[i])
+                body_pct = body / (highs[i] - lows[i] + 1e-9)
+                if body_pct >= 0.4:
+                    is_red = closes[i] > opens[i]
+                    result['big_volume_k'].append({
+                        'i': i, 'is_red': is_red, 'date': str(dates[i])[:10],
+                        'close': round(float(closes[i]), 2),
+                        'support_or_resist': 'support' if is_red else 'resist',
+                        'label': f'大量{"長紅K支撐" if is_red else "長黑K壓力"} @ {closes[i]:.2f}',
+                        'vol_ratio': round(float(volumes[i] / avg_vol), 1),
+                    })
+        # 只保留最近5個
+        result['big_volume_k'] = sorted(result['big_volume_k'], key=lambda x: x['i'])[-5:]
+
+    # ── ⑥ 二分之一價 ────────────────────────────────────────────
+    max_h, min_l = float(np.max(highs)), float(np.min(lows))
+    result['half_price'] = round((max_h + min_l) / 2, 2)
+
+    # ── 摘要文字供 GPT 參考 ─────────────────────────────────────
+    lines = ["【朱家泓切線系統 支撐壓力分析】"]
+
+    if result['trendlines']:
+        for tl in result['trendlines']:
+            lines.append(f"  {tl['label']}：延伸至今為 {tl['current_value']:.2f}")
+
+    sups = [str(p['v']) for p in result['h_supports'][-3:]]
+    ress = [str(p['v']) for p in result['h_resistances'][-3:]]
+    if sups:  lines.append(f"  水平支撐（轉折低點）：{' / '.join(sups)}")
+    if ress:  lines.append(f"  水平壓力（轉折高點）：{' / '.join(ress)}")
+
+    if result['consolidations']:
+        last_c = result['consolidations'][-1]
+        lines.append(f"  最近盤整區：{last_c['lo']}–{last_c['hi']}（{last_c['date_start']}起）")
+
+    if result['gaps']:
+        recent_g = result['gaps'][-2:]
+        for g in recent_g:
+            lines.append(f"  {g['label']}（{g['date']}）")
+
+    if result['big_volume_k']:
+        last_bk = result['big_volume_k'][-1]
+        lines.append(f"  {last_bk['label']}（量比{last_bk['vol_ratio']}x，{last_bk['date']}）")
+
+    lines.append(f"  二分之一波段價：{result['half_price']}")
+
+    result['summary_text'] = '\n'.join(lines)
+    return result
+
+
+def add_sr_traces_to_fig(fig, df, sr_result, row=1):
+    """
+    將 calculate_zhu_sr_levels 的結果以 Plotly trace 加入 K 線圖第 row 列。
+    包含：切線、軌道線、水平支撐/壓力線、盤整區色塊、缺口色塊、大量K棒標記、½ 價位線。
+    """
+    if df is None or sr_result is None:
+        return fig
+
+    n = len(df)
+    dates = df['date'].values if 'date' in df.columns else list(range(n))
+
+    def idx_to_date(i):
+        i = max(0, min(i, n - 1))
+        return str(dates[i])[:10]
+
+    # ── 切線 ──────────────────────────────────────────────────────
+    for tl in sr_result.get('trendlines', []):
+        x0, x1 = idx_to_date(tl['i_start']), idx_to_date(tl['i_end'])
+        fig.add_shape(type='line', x0=x0, y0=tl['v_start'], x1=x1, y1=tl['v_end'],
+                      line=dict(color=tl['color'], width=tl.get('width', 2),
+                                dash=tl.get('dash', 'solid')),
+                      row=row, col=1)
+        # 標籤
+        fig.add_annotation(x=x1, y=tl['v_end'], text=tl['label'],
+                           showarrow=False, font=dict(size=10, color=tl['color']),
+                           xanchor='right', bgcolor='rgba(255,255,255,0.75)',
+                           bordercolor=tl['color'], borderwidth=1,
+                           row=row, col=1)
+
+    # ── 軌道線 ────────────────────────────────────────────────────
+    for ch in sr_result.get('channels', []):
+        x0, x1 = idx_to_date(ch['i_start']), idx_to_date(ch['i_end'])
+        fig.add_shape(type='line', x0=x0, y0=ch['v_start'], x1=x1, y1=ch['v_end'],
+                      line=dict(color=ch['color'], width=1, dash='dot'),
+                      row=row, col=1)
+
+    # ── 水平支撐（藍色虛線）─────────────────────────────────────
+    for sup in sr_result.get('h_supports', []):
+        fig.add_hline(y=sup['v'],
+                      line=dict(color='#3498db', width=1.2, dash='dash'),
+                      annotation_text=f"撐 {sup['v']:.2f} ({sup['date'][:5]})",
+                      annotation_font_size=9, annotation_font_color='#1a6fa8',
+                      annotation_bgcolor='rgba(255,255,255,0.7)',
+                      row=row, col=1)
+
+    # ── 水平壓力（橘色虛線）─────────────────────────────────────
+    for res in sr_result.get('h_resistances', []):
+        fig.add_hline(y=res['v'],
+                      line=dict(color='#e67e22', width=1.2, dash='dash'),
+                      annotation_text=f"壓 {res['v']:.2f} ({res['date'][:5]})",
+                      annotation_font_size=9, annotation_font_color='#a04000',
+                      annotation_bgcolor='rgba(255,255,255,0.7)',
+                      row=row, col=1)
+
+    # ── 盤整區（橘色半透明色塊，最近2個）────────────────────────
+    for con in sr_result.get('consolidations', [])[-2:]:
+        x0 = idx_to_date(con['i0'])
+        x1 = idx_to_date(con['i1'])
+        fig.add_shape(type='rect',
+                      x0=x0, y0=con['lo'], x1=x1, y1=con['hi'],
+                      fillcolor='rgba(241,196,15,0.10)',
+                      line=dict(color='#e67e22', width=0.8, dash='dot'),
+                      row=row, col=1)
+        mid_i = (con['i0'] + con['i1']) // 2
+        fig.add_annotation(x=idx_to_date(mid_i), y=con['hi'],
+                           text='盤整區', showarrow=False,
+                           font=dict(size=9, color='#a04000'),
+                           bgcolor='rgba(255,255,255,0.6)',
+                           row=row, col=1)
+
+    # ── 跳空缺口（半透明色塊，最近4個）─────────────────────────
+    for gap in sr_result.get('gaps', [])[-4:]:
+        g_date = gap['date']
+        fill_c = 'rgba(46,213,115,0.12)' if gap['type'] == 'up' else 'rgba(255,71,87,0.10)'
+        line_c = '#2ecc71' if gap['type'] == 'up' else '#e74c3c'
+        # 用前後日期撐開色塊（1個交易日寬）
+        i_prev = max(0, gap['i'] - 1)
+        fig.add_shape(type='rect',
+                      x0=idx_to_date(i_prev), y0=gap['lo'],
+                      x1=idx_to_date(gap['i']), y1=gap['hi'],
+                      fillcolor=fill_c,
+                      line=dict(color=line_c, width=0.6, dash='dot'),
+                      row=row, col=1)
+
+    # ── 大量K棒支撐/壓力標記（散點箭頭）────────────────────────
+    for bk in sr_result.get('big_volume_k', []):
+        g_date = bk['date']
+        marker_sym = 'triangle-up' if bk['is_red'] else 'triangle-down'
+        marker_col = '#27ae60' if bk['is_red'] else '#c0392b'
+        # 取實際 close 價位
+        try:
+            row_data = df[df['date'].astype(str).str[:10] == g_date].iloc[0]
+            y_val = row_data['low'] * 0.99 if bk['is_red'] else row_data['high'] * 1.01
+        except Exception:
+            y_val = bk['close']
+        fig.add_trace(go.Scatter(
+            x=[g_date], y=[y_val],
+            mode='markers+text',
+            marker=dict(symbol=marker_sym, size=11, color=marker_col),
+            text=[f'量{bk["vol_ratio"]}x'],
+            textfont=dict(size=8, color=marker_col),
+            textposition='top center' if bk['is_red'] else 'bottom center',
+            name='大量K棒',
+            showlegend=False,
+            hovertext=bk['label'],
+        ), row=row, col=1)
+
+    # ── 二分之一價（紫色點線）────────────────────────────────────
+    half_p = sr_result.get('half_price')
+    if half_p:
+        fig.add_hline(y=half_p,
+                      line=dict(color='#8e44ad', width=1.2, dash='dashdot'),
+                      annotation_text=f"½波段 {half_p}",
+                      annotation_font_size=9, annotation_font_color='#8e44ad',
+                      annotation_bgcolor='rgba(255,255,255,0.7)',
+                      row=row, col=1)
 
     return fig
 
@@ -4444,7 +4796,7 @@ def create_oscillator_chart(df, symbol):
 
 def generate_stock_evaluation(symbol, stock_data, openai_api_key, market='us',
                                zhu_result=None, bull_signals=None, kline_result=None,
-                               mnemonics_result=None, rsi_period=14,
+                               mnemonics_result=None, sr_result=None, rsi_period=14,
                                institutional_df=None, margin_df=None,
                                weekly_df=None, financial_data=None,
                                analyst_data=None, insider_df=None, director_df=None):
@@ -4633,6 +4985,8 @@ def generate_stock_evaluation(symbol, stock_data, openai_api_key, market='us',
             lines_list.append(f"\n【朱家泓12口訣辨識】{m_summary}")
             if m_bull: lines_list.append(f"  多頭口訣：{m_bull} — " + "；".join(mnemonics_result['bull_signals']))
             if m_bear: lines_list.append(f"  空頭口訣：{m_bear} — " + "；".join(mnemonics_result['bear_signals']))
+        if sr_result and sr_result.get('summary_text'):
+            lines_list.append(f"\n{sr_result['summary_text']}")
 
         data_block = "\n".join(lines_list)
 
@@ -4734,7 +5088,7 @@ def generate_stock_evaluation(symbol, stock_data, openai_api_key, market='us',
 
 def generate_investment_advice(symbol, stock_data, openai_api_key, market='us', zhu_result=None,
                                 bull_signals=None, kline_result=None, mnemonics_result=None,
-                                rsi_period=14,
+                                sr_result=None, rsi_period=14,
                                 institutional_df=None, margin_df=None,
                                 financial_data=None, analyst_data=None,
                                 insider_df=None, director_df=None):
@@ -4851,6 +5205,10 @@ def generate_investment_advice(symbol, stock_data, openai_api_key, market='us', 
             summary_lines.append(
                 "  ※ 口訣3（利多不漲/利空不跌）及口訣4（空頭利空不跌）需結合基本面/消息面由AI研判"
             )
+
+        # 朱家泓切線系統支撐壓力
+        if sr_result and sr_result.get('summary_text'):
+            summary_lines.append(f"\n{sr_result['summary_text']}")
 
         # 台股籌碼附加
         if market == 'tw':
@@ -4990,7 +5348,7 @@ def generate_investment_advice(symbol, stock_data, openai_api_key, market='us', 
 def generate_ai_insights(symbol, stock_data, openai_api_key, start_date, end_date,
                           market='us', margin_df=None, institutional_df=None,
                           financial_data=None, rsi_period=14, bull_signals=None,
-                          kline_result=None, mnemonics_result=None,
+                          kline_result=None, mnemonics_result=None, sr_result=None,
                           insider_df=None, analyst_data=None,
                           weekly_df=None, director_df=None):
     try:
@@ -5217,6 +5575,10 @@ def generate_ai_insights(symbol, stock_data, openai_api_key, start_date, end_dat
             user_prompt += "\n".join(mne_lines) + "\n"
         elif mnemonics_result:
             user_prompt += "\n### 朱家泓12口訣：目前無明顯口訣訊號觸發，建議繼續觀察。\n"
+
+        # 朱家泓切線系統支撐壓力
+        if sr_result and sr_result.get('summary_text'):
+            user_prompt += f"\n{sr_result['summary_text']}\n"
 
         # 分析架構
         conclusion_extra = """
@@ -5609,10 +5971,18 @@ if analyze_button:
                         pass
 
                 # ── Step 5: 計算多頭訊號 ──
-                bull_signals = calculate_bull_signals(data_with_indicators)
-                zhu_result   = calculate_zhu_trend_system(data_with_indicators)
-                kline_result    = calculate_kline_pattern_system(data_with_indicators)
+                bull_signals     = calculate_bull_signals(data_with_indicators)
+                zhu_result       = calculate_zhu_trend_system(data_with_indicators)
+                kline_result     = calculate_kline_pattern_system(data_with_indicators)
                 mnemonics_result = calculate_zhu_mnemonics(data_with_indicators)
+
+                # ── Step 5b: 朱家泓切線系統 支撐壓力自動計算 ──
+                with st.spinner("計算切線系統支撐壓力（朱家泓第5–6章）..."):
+                    try:
+                        sr_result = calculate_zhu_sr_levels(data_with_indicators)
+                    except Exception as _sr_err:
+                        sr_result = None
+                        st.caption(f"切線支撐壓力計算跳過：{_sr_err}")
 
                 # ── Step 6: 籌碼/附加數據 ──
                 margin_df        = None
@@ -5698,7 +6068,8 @@ if analyze_button:
                         currency_symbol,
                         institutional_df=institutional_df,
                         market=market_key,
-                        selected_mas=selected_mas
+                        selected_mas=selected_mas,
+                        sr_result=sr_result
                     )
                     st.plotly_chart(chart, use_container_width=True)
 
@@ -6582,6 +6953,7 @@ if analyze_button:
                             bull_signals=bull_signals,
                             kline_result=kline_result,
                             mnemonics_result=mnemonics_result,
+                            sr_result=sr_result,
                             insider_df=insider_df,
                             analyst_data=analyst_data,
                             weekly_df=weekly_df,
@@ -6620,6 +6992,7 @@ if analyze_button:
                             zhu_result=zhu_result,
                             kline_result=kline_result,
                             mnemonics_result=mnemonics_result,
+                            sr_result=sr_result,
                             rsi_period=rsi_period,
                             institutional_df=institutional_df if is_tw else None,
                             margin_df=margin_df if is_tw else None,
@@ -6653,6 +7026,7 @@ if analyze_button:
                             bull_signals=bull_signals,
                             kline_result=kline_result,
                             mnemonics_result=mnemonics_result,
+                            sr_result=sr_result,
                             rsi_period=rsi_period,
                             institutional_df=institutional_df if is_tw else None,
                             margin_df=margin_df if is_tw else None,
