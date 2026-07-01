@@ -3693,10 +3693,23 @@ def create_candlestick_chart(df, symbol, rsi_period, currency_symbol,
 
     # ── 佈局更新 ──
     fig.update_layout(
-        title=f'{symbol} 主K線圖（含布林通道、MA、RSI、OBV、KD）',
+        title=dict(
+            text=f'{symbol} 主K線圖（含布林通道、MA、RSI、OBV、KD）',
+            font=dict(size=14),
+            x=0, xanchor='left',
+            pad=dict(t=4, l=0),
+        ),
         height=chart_height,
         showlegend=True,
-        legend=dict(orientation="h", yanchor="bottom", y=1.02, xanchor="right", x=1),
+        legend=dict(
+            orientation="v",       # 垂直排列，不與標題搶水平空間
+            yanchor="top", y=1,
+            xanchor="left", x=1.01,
+            bgcolor="rgba(255,255,255,0.85)",
+            bordercolor="#ddd", borderwidth=1,
+            font=dict(size=10),
+        ),
+        margin=dict(t=60, r=160),  # 上方給標題空間，右方給圖例空間
         template='plotly_white'
     )
     fig.update_xaxes(rangeslider_visible=False)
