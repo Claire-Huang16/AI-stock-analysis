@@ -221,6 +221,55 @@ def get_tw_company_profile(stock_code):
     return profile
 
 
+@st.cache_data(ttl=86400)
+def get_tw_stock_display_name(stock_code: str, finmind_token: str = "") -> dict:
+    """
+    台股代號 → 公司名稱（雙層備援）
+    ① FinMind TaiwanStockInfo（線上，最準確）
+    ② twstock 本地資料庫（備援）
+    回傳 dict：name / source / industry / market
+    """
+    code = stock_code.strip()
+    result = {"name": "", "source": "unknown", "industry": "", "market": ""}
+
+    # ── ① FinMind TaiwanStockInfo ──
+    if finmind_token:
+        try:
+            resp = requests.get(
+                "https://api.finmindtrade.com/api/v4/data",
+                params={"dataset": "TaiwanStockInfo", "data_id": code, "token": finmind_token},
+                timeout=10
+            )
+            if resp.status_code == 200:
+                j = resp.json()
+                if j.get("status") == 200 and j.get("data"):
+                    row = j["data"][0]
+                    name = row.get("stock_name", "").strip()
+                    if name and name != code:
+                        result.update({"name": name, "source": "finmind",
+                                       "industry": row.get("industry_category", ""),
+                                       "market": row.get("type", "")})
+                        return result
+        except Exception:
+            pass
+
+    # ── ② twstock 本地備援 ──
+    if _USE_TWSTOCK:
+        try:
+            info = _TW_CODES.get(code)
+            if info:
+                name = getattr(info, "name", "").strip()
+                if name and name != code:
+                    result.update({"name": name, "source": "twstock",
+                                   "industry": getattr(info, "group", ""),
+                                   "market": getattr(info, "market", "")})
+                    return result
+        except Exception:
+            pass
+
+    return result
+
+
 @st.cache_data(ttl=1800)
 def get_finmind_stock_price_latest(stock_code, finmind_token):
     """台股最新股價（TaiwanStockPrice，近10天取最後一筆）"""
@@ -3642,10 +3691,6 @@ def create_candlestick_chart(df, symbol, rsi_period, currency_symbol,
                 ), row=kd_row, col=1)
         fig.update_yaxes(range=[0, 100], row=kd_row, col=1)
 
-    # ── 朱家泓切線系統支撐壓力標注（Row 1）──────────────────────
-    if sr_result is not None:
-        fig = add_sr_traces_to_fig(fig, df, sr_result, row=1)
-
     # ── 佈局更新 ──
     fig.update_layout(
         title=f'{symbol} 主K線圖（含布林通道、MA、RSI、OBV、KD）',
@@ -3904,92 +3949,105 @@ def add_sr_traces_to_fig(fig, df, sr_result, row=1):
 
     n = len(df)
     dates = df['date'].values if 'date' in df.columns else list(range(n))
+    is_subplot = (row is not None)  # None = standalone figure, no row/col kwargs
 
     def idx_to_date(i):
         i = max(0, min(i, n - 1))
         return str(dates[i])[:10]
 
+    def add_shape(**kwargs):
+        if is_subplot:
+            fig.add_shape(row=row, col=1, **kwargs)
+        else:
+            fig.add_shape(**kwargs)
+
+    def add_annotation(**kwargs):
+        if is_subplot:
+            fig.add_annotation(row=row, col=1, **kwargs)
+        else:
+            fig.add_annotation(**kwargs)
+
+    def add_hline(**kwargs):
+        if is_subplot:
+            fig.add_hline(row=row, col=1, **kwargs)
+        else:
+            fig.add_hline(**kwargs)
+
+    def add_trace_sr(trace):
+        if is_subplot:
+            fig.add_trace(trace, row=row, col=1)
+        else:
+            fig.add_trace(trace)
+
     # ── 切線 ──────────────────────────────────────────────────────
     for tl in sr_result.get('trendlines', []):
         x0, x1 = idx_to_date(tl['i_start']), idx_to_date(tl['i_end'])
-        fig.add_shape(type='line', x0=x0, y0=tl['v_start'], x1=x1, y1=tl['v_end'],
-                      line=dict(color=tl['color'], width=tl.get('width', 2),
-                                dash=tl.get('dash', 'solid')),
-                      row=row, col=1)
-        # 標籤
-        fig.add_annotation(x=x1, y=tl['v_end'], text=tl['label'],
-                           showarrow=False, font=dict(size=10, color=tl['color']),
-                           xanchor='right', bgcolor='rgba(255,255,255,0.75)',
-                           bordercolor=tl['color'], borderwidth=1,
-                           row=row, col=1)
+        add_shape(type='line', x0=x0, y0=tl['v_start'], x1=x1, y1=tl['v_end'],
+                  line=dict(color=tl['color'], width=tl.get('width', 2),
+                            dash=tl.get('dash', 'solid')))
+        add_annotation(x=x1, y=tl['v_end'], text=tl['label'],
+                       showarrow=False, font=dict(size=10, color=tl['color']),
+                       xanchor='right', bgcolor='rgba(255,255,255,0.75)',
+                       bordercolor=tl['color'], borderwidth=1)
 
     # ── 軌道線 ────────────────────────────────────────────────────
     for ch in sr_result.get('channels', []):
         x0, x1 = idx_to_date(ch['i_start']), idx_to_date(ch['i_end'])
-        fig.add_shape(type='line', x0=x0, y0=ch['v_start'], x1=x1, y1=ch['v_end'],
-                      line=dict(color=ch['color'], width=1, dash='dot'),
-                      row=row, col=1)
+        add_shape(type='line', x0=x0, y0=ch['v_start'], x1=x1, y1=ch['v_end'],
+                  line=dict(color=ch['color'], width=1, dash='dot'))
 
     # ── 水平支撐（藍色虛線）─────────────────────────────────────
     for sup in sr_result.get('h_supports', []):
-        fig.add_hline(y=sup['v'],
-                      line=dict(color='#3498db', width=1.2, dash='dash'),
-                      annotation_text=f"撐 {sup['v']:.2f} ({sup['date'][:5]})",
-                      annotation_font_size=9, annotation_font_color='#1a6fa8',
-                      annotation_bgcolor='rgba(255,255,255,0.7)',
-                      row=row, col=1)
+        add_hline(y=sup['v'],
+                  line=dict(color='#3498db', width=1.2, dash='dash'),
+                  annotation_text=f"撐 {sup['v']:.2f} ({sup['date'][:5]})",
+                  annotation_font_size=9, annotation_font_color='#1a6fa8',
+                  annotation_bgcolor='rgba(255,255,255,0.7)')
 
     # ── 水平壓力（橘色虛線）─────────────────────────────────────
     for res in sr_result.get('h_resistances', []):
-        fig.add_hline(y=res['v'],
-                      line=dict(color='#e67e22', width=1.2, dash='dash'),
-                      annotation_text=f"壓 {res['v']:.2f} ({res['date'][:5]})",
-                      annotation_font_size=9, annotation_font_color='#a04000',
-                      annotation_bgcolor='rgba(255,255,255,0.7)',
-                      row=row, col=1)
+        add_hline(y=res['v'],
+                  line=dict(color='#e67e22', width=1.2, dash='dash'),
+                  annotation_text=f"壓 {res['v']:.2f} ({res['date'][:5]})",
+                  annotation_font_size=9, annotation_font_color='#a04000',
+                  annotation_bgcolor='rgba(255,255,255,0.7)')
 
     # ── 盤整區（橘色半透明色塊，最近2個）────────────────────────
     for con in sr_result.get('consolidations', [])[-2:]:
         x0 = idx_to_date(con['i0'])
         x1 = idx_to_date(con['i1'])
-        fig.add_shape(type='rect',
-                      x0=x0, y0=con['lo'], x1=x1, y1=con['hi'],
-                      fillcolor='rgba(241,196,15,0.10)',
-                      line=dict(color='#e67e22', width=0.8, dash='dot'),
-                      row=row, col=1)
+        add_shape(type='rect',
+                  x0=x0, y0=con['lo'], x1=x1, y1=con['hi'],
+                  fillcolor='rgba(241,196,15,0.10)',
+                  line=dict(color='#e67e22', width=0.8, dash='dot'))
         mid_i = (con['i0'] + con['i1']) // 2
-        fig.add_annotation(x=idx_to_date(mid_i), y=con['hi'],
-                           text='盤整區', showarrow=False,
-                           font=dict(size=9, color='#a04000'),
-                           bgcolor='rgba(255,255,255,0.6)',
-                           row=row, col=1)
+        add_annotation(x=idx_to_date(mid_i), y=con['hi'],
+                       text='盤整區', showarrow=False,
+                       font=dict(size=9, color='#a04000'),
+                       bgcolor='rgba(255,255,255,0.6)')
 
     # ── 跳空缺口（半透明色塊，最近4個）─────────────────────────
     for gap in sr_result.get('gaps', [])[-4:]:
-        g_date = gap['date']
         fill_c = 'rgba(46,213,115,0.12)' if gap['type'] == 'up' else 'rgba(255,71,87,0.10)'
         line_c = '#2ecc71' if gap['type'] == 'up' else '#e74c3c'
-        # 用前後日期撐開色塊（1個交易日寬）
         i_prev = max(0, gap['i'] - 1)
-        fig.add_shape(type='rect',
-                      x0=idx_to_date(i_prev), y0=gap['lo'],
-                      x1=idx_to_date(gap['i']), y1=gap['hi'],
-                      fillcolor=fill_c,
-                      line=dict(color=line_c, width=0.6, dash='dot'),
-                      row=row, col=1)
+        add_shape(type='rect',
+                  x0=idx_to_date(i_prev), y0=gap['lo'],
+                  x1=idx_to_date(gap['i']), y1=gap['hi'],
+                  fillcolor=fill_c,
+                  line=dict(color=line_c, width=0.6, dash='dot'))
 
     # ── 大量K棒支撐/壓力標記（散點箭頭）────────────────────────
     for bk in sr_result.get('big_volume_k', []):
         g_date = bk['date']
         marker_sym = 'triangle-up' if bk['is_red'] else 'triangle-down'
         marker_col = '#27ae60' if bk['is_red'] else '#c0392b'
-        # 取實際 close 價位
         try:
             row_data = df[df['date'].astype(str).str[:10] == g_date].iloc[0]
             y_val = row_data['low'] * 0.99 if bk['is_red'] else row_data['high'] * 1.01
         except Exception:
             y_val = bk['close']
-        fig.add_trace(go.Scatter(
+        add_trace_sr(go.Scatter(
             x=[g_date], y=[y_val],
             mode='markers+text',
             marker=dict(symbol=marker_sym, size=11, color=marker_col),
@@ -3999,17 +4057,117 @@ def add_sr_traces_to_fig(fig, df, sr_result, row=1):
             name='大量K棒',
             showlegend=False,
             hovertext=bk['label'],
-        ), row=row, col=1)
+        ))
 
     # ── 二分之一價（紫色點線）────────────────────────────────────
     half_p = sr_result.get('half_price')
     if half_p:
-        fig.add_hline(y=half_p,
-                      line=dict(color='#8e44ad', width=1.2, dash='dashdot'),
-                      annotation_text=f"½波段 {half_p}",
-                      annotation_font_size=9, annotation_font_color='#8e44ad',
-                      annotation_bgcolor='rgba(255,255,255,0.7)',
-                      row=row, col=1)
+        add_hline(y=half_p,
+                  line=dict(color='#8e44ad', width=1.2, dash='dashdot'),
+                  annotation_text=f"½波段 {half_p}",
+                  annotation_font_size=9, annotation_font_color='#8e44ad',
+                  annotation_bgcolor='rgba(255,255,255,0.7)')
+
+    return fig
+
+
+def create_sr_chart(df, symbol, sr_result, currency_symbol='NT$'):
+    """
+    朱家泓切線系統 — 獨立支撐壓力K線圖。
+    乾淨的單層 K 線，疊加七大支撐壓力標注：
+      切線 / 軌道線 / 水平支撐壓力 / 盤整區 / 跳空缺口 / 大量K棒 / ½ 價位
+    不含 RSI/OBV/KD/成交量等指標，保持清晰。
+    """
+    if df is None or sr_result is None or len(df) < 5:
+        return None
+
+    import plotly.graph_objects as go
+
+    fig = go.Figure()
+
+    # ── K 線（台股：紅=漲，綠=跌）──
+    fig.add_trace(go.Candlestick(
+        x=df['date'],
+        open=df['open'], high=df['high'],
+        low=df['low'],  close=df['close'],
+        increasing=dict(line=dict(color='#e74c3c', width=1.2),
+                        fillcolor='#e74c3c'),
+        decreasing=dict(line=dict(color='#27ae60', width=1.2),
+                        fillcolor='#27ae60'),
+        name='K線',
+        showlegend=False,
+    ))
+
+    # ── MA20 / MA60（細線，背景參考）──
+    closes = df['close'].values.astype(float)
+    n = len(closes)
+    ma20 = [float(closes[max(0,i-19):i+1].mean()) if i >= 19 else None for i in range(n)]
+    ma60 = [float(closes[max(0,i-59):i+1].mean()) if i >= 59 else None for i in range(n)]
+    for ma_vals, col, nm in [(ma20, '#9b59b6', 'MA20'), (ma60, '#e67e22', 'MA60')]:
+        valid = [(df['date'].iloc[i], v) for i, v in enumerate(ma_vals) if v is not None]
+        if valid:
+            xs, ys = zip(*valid)
+            fig.add_trace(go.Scatter(
+                x=list(xs), y=list(ys), mode='lines', name=nm,
+                line=dict(color=col, width=1.2, dash='dot'),
+                opacity=0.6, showlegend=True,
+            ))
+
+    # ── 疊加七大支撐壓力 ──
+    fig = add_sr_traces_to_fig(fig, df, sr_result, row=None)
+
+    # ── 圖表說明 annotation（右上角）──
+    legend_items = [
+        ('━', '#27ae60', '上升切線（支撐）'),
+        ('━', '#e74c3c', '下降切線（壓力）'),
+        ('╌', '#3498db', '水平支撐'),
+        ('╌', '#e67e22', '水平壓力'),
+        ('□', '#f39c12', '盤整區'),
+        ('▤', '#27ae60', '向上缺口支撐'),
+        ('▤', '#e74c3c', '向下缺口壓力'),
+        ('╌', '#8e44ad', '½ 波段價'),
+    ]
+
+    fig.update_layout(
+        title=dict(
+            text=f'📐 {symbol} — 朱家泓切線系統 支撐壓力分析圖',
+            font=dict(size=16),
+        ),
+        height=620,
+        showlegend=True,
+        legend=dict(orientation='h', yanchor='bottom', y=1.02,
+                    xanchor='right', x=1, font=dict(size=11)),
+        template='plotly_white',
+        xaxis_rangeslider_visible=False,
+        yaxis_title=f'價格（{currency_symbol}）',
+        plot_bgcolor='#fafafa',
+        margin=dict(l=60, r=160, t=80, b=40),
+        annotations=[
+            # 標注框說明（右側）
+            dict(
+                text=(
+                    '<b>圖例說明</b><br>'
+                    '━ <span style="color:#27ae60">上升切線（支撐）</span><br>'
+                    '━ <span style="color:#e74c3c">下降切線（壓力）</span><br>'
+                    '╌ <span style="color:#3498db">水平支撐（轉折低）</span><br>'
+                    '╌ <span style="color:#e67e22">水平壓力（轉折高）</span><br>'
+                    '□ <span style="color:#c0932a">盤整區（套牢/進貨）</span><br>'
+                    '▤ <span style="color:#27ae60">向上跳空缺口（支撐）</span><br>'
+                    '▤ <span style="color:#e74c3c">向下跳空缺口（壓力）</span><br>'
+                    '╌ <span style="color:#8e44ad">½ 波段中間價</span><br>'
+                    '▲▼ 大量K棒位置'
+                ),
+                xref='paper', yref='paper',
+                x=1.01, y=0.98,
+                xanchor='left', yanchor='top',
+                showarrow=False,
+                font=dict(size=10, family='Noto Sans TC, sans-serif'),
+                bgcolor='rgba(255,255,255,0.88)',
+                bordercolor='#ddd', borderwidth=1,
+                align='left',
+            ),
+        ],
+    )
 
     return fig
 
@@ -6059,6 +6217,67 @@ if analyze_button:
 
                 if data_with_indicators is not None:
 
+                    # ── 顯示 0：股票代號 + 公司名稱 橫幅 ──
+                    _sym_display = symbol.strip() if is_tw else symbol.upper()
+
+                    if is_tw:
+                        _name_info = get_tw_stock_display_name(
+                            symbol.strip(),
+                            finmind_token=finmind_api_key or ""
+                        )
+                        _company_name = _name_info.get("name", "")
+                        _industry     = _name_info.get("industry", "")
+                        _market_type  = _name_info.get("market", "")
+                        _src_label    = ("FinMind" if _name_info["source"] == "finmind"
+                                         else ("twstock" if _name_info["source"] == "twstock" else ""))
+                    else:
+                        _company_name = ""
+                        _industry     = ""
+                        _market_type  = "US"
+                        _src_label    = ""
+                        try:
+                            import yfinance as _yf
+                            _yinfo = _yf.Ticker(_sym_display).info
+                            _company_name = _yinfo.get("longName") or _yinfo.get("shortName") or ""
+                            _industry     = _yinfo.get("sector") or _yinfo.get("industry") or ""
+                        except Exception:
+                            pass
+
+                    _tag_map = {"twse": "上市", "tpex": "上櫃", "otc": "上櫃",
+                                "emerging": "興櫃", "US": "美股"}
+                    _meta_tags = []
+                    if _market_type:
+                        _meta_tags.append(_tag_map.get(_market_type.lower(), _market_type))
+                    if _industry:
+                        _meta_tags.append(_industry)
+                    if _src_label:
+                        _meta_tags.append(f"資料來源：{_src_label}")
+
+                    _tags_html = "".join(
+                        f'<span style="background:rgba(167,139,250,0.12);color:#a29bfe;'
+                        f'border:0.5px solid rgba(167,139,250,0.3);border-radius:12px;'
+                        f'padding:3px 10px;font-size:12px;margin-right:6px;">{t}</span>'
+                        for t in _meta_tags
+                    )
+                    _name_part = (
+                        f'<span style="font-size:22px;font-weight:400;color:#adb5bd;'
+                        f'margin-left:14px;">{_company_name}</span>'
+                        if _company_name else ""
+                    )
+                    st.markdown(
+                        f'''<div style="
+                          padding:14px 20px;margin-bottom:10px;
+                          background:linear-gradient(135deg,rgba(26,26,46,0.9) 0%,rgba(22,33,62,0.9) 100%);
+                          border:1px solid rgba(167,139,250,0.25);border-radius:12px;">
+                          <div>
+                            <span style="font-size:28px;font-weight:700;color:#fff;letter-spacing:0.5px;">{_sym_display}</span>
+                            {_name_part}
+                          </div>
+                          <div style="margin-top:7px;">{_tags_html}</div>
+                        </div>''',
+                        unsafe_allow_html=True,
+                    )
+
                     # ── 顯示 1：主K線圖（圖1）──
                     st.markdown("### 📊 主K線圖（含布林通道、OBV、成交量）")
                     chart = create_candlestick_chart(
@@ -6068,8 +6287,7 @@ if analyze_button:
                         currency_symbol,
                         institutional_df=institutional_df,
                         market=market_key,
-                        selected_mas=selected_mas,
-                        sr_result=sr_result
+                        selected_mas=selected_mas
                     )
                     st.plotly_chart(chart, use_container_width=True)
 
@@ -6093,6 +6311,22 @@ if analyze_button:
                         if weekly_chart:
                             st.markdown("### 📅 周K線圖（含MACD）")
                             st.plotly_chart(weekly_chart, use_container_width=True)
+
+                    # ── 顯示 3b：朱家泓切線系統 支撐壓力圖（獨立乾淨圖）──
+                    if sr_result is not None:
+                        sr_chart = create_sr_chart(
+                            data_with_indicators,
+                            symbol.upper() if not is_tw else symbol.strip(),
+                            sr_result,
+                            currency_symbol=currency_symbol,
+                        )
+                        if sr_chart:
+                            st.markdown("### 📐 切線系統 — 支撐壓力分析圖")
+                            st.caption(
+                                "依朱家泓《切線》第5–6章 七大支撐壓力來源："
+                                "切線 / 軌道線 / 水平支撐壓力 / 盤整區 / 跳空缺口 / 大量K棒 / ½ 波段價"
+                            )
+                            st.plotly_chart(sr_chart, use_container_width=True)
 
                     # ── 顯示 4（台股）：融資融券 ──
                     if is_tw and margin_df is not None and len(margin_df) > 0:
