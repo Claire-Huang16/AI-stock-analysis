@@ -6341,6 +6341,155 @@ if analyze_button:
                             )
                             st.plotly_chart(sr_chart, use_container_width=True)
 
+                            # ── 支撐壓力價格摘要表 ──────────────────────────
+                            cur_price = float(data_with_indicators['close'].iloc[-1])
+
+                            rows_sup, rows_res = [], []
+
+                            # 切線（延伸到今）
+                            for tl in sr_result.get('trendlines', []):
+                                v = tl.get('current_value')
+                                if v is None:
+                                    continue
+                                dist_pct = (cur_price - v) / cur_price * 100
+                                entry = {
+                                    '類型': tl['label'],
+                                    '價格': f"{v:.2f}",
+                                    '距現價': f"{dist_pct:+.1f}%",
+                                }
+                                if v <= cur_price:
+                                    rows_sup.append(entry)
+                                else:
+                                    rows_res.append(entry)
+
+                            # 水平支撐（轉折低點）
+                            for p in sorted(sr_result.get('h_supports', []), key=lambda x: -x['v']):
+                                v = p['v']
+                                dist_pct = (cur_price - v) / cur_price * 100
+                                rows_sup.append({
+                                    '類型': f"水平支撐（{p['date'][:7]}轉折低）",
+                                    '價格': f"{v:.2f}",
+                                    '距現價': f"{dist_pct:+.1f}%",
+                                })
+
+                            # 水平壓力（轉折高點）
+                            for p in sorted(sr_result.get('h_resistances', []), key=lambda x: x['v']):
+                                v = p['v']
+                                dist_pct = (v - cur_price) / cur_price * 100
+                                rows_res.append({
+                                    '類型': f"水平壓力（{p['date'][:7]}轉折高）",
+                                    '價格': f"{v:.2f}",
+                                    '距現價': f"{dist_pct:+.1f}%",
+                                })
+
+                            # 盤整區（最近1個）
+                            for con in sr_result.get('consolidations', [])[-1:]:
+                                dist_lo = (cur_price - con['lo']) / cur_price * 100
+                                dist_hi = (con['hi'] - cur_price) / cur_price * 100
+                                rows_sup.append({
+                                    '類型': f"盤整區下緣（{con['date_start'][:7]}起）",
+                                    '價格': f"{con['lo']:.2f}",
+                                    '距現價': f"{dist_lo:+.1f}%",
+                                })
+                                rows_res.append({
+                                    '類型': f"盤整區上緣（{con['date_start'][:7]}起）",
+                                    '價格': f"{con['hi']:.2f}",
+                                    '距現價': f"{dist_hi:+.1f}%",
+                                })
+
+                            # 跳空缺口（最近）
+                            for g in sr_result.get('gaps', [])[-3:]:
+                                mid = (g['lo'] + g['hi']) / 2
+                                if g['type'] == 'up':
+                                    dist_pct = (cur_price - mid) / cur_price * 100
+                                    rows_sup.append({
+                                        '類型': f"向上缺口支撐（{g['date'][:7]}）",
+                                        '價格': f"{g['lo']:.2f} – {g['hi']:.2f}",
+                                        '距現價': f"{dist_pct:+.1f}%",
+                                    })
+                                else:
+                                    dist_pct = (mid - cur_price) / cur_price * 100
+                                    rows_res.append({
+                                        '類型': f"向下缺口壓力（{g['date'][:7]}）",
+                                        '價格': f"{g['lo']:.2f} – {g['hi']:.2f}",
+                                        '距現價': f"{dist_pct:+.1f}%",
+                                    })
+
+                            # 大量K棒
+                            for bk in sr_result.get('big_volume_k', [])[-2:]:
+                                v = bk['close']
+                                dist_pct = (cur_price - v) / cur_price * 100
+                                label = f"大量{'長紅支撐' if bk['is_red'] else '長黑壓力'}（{bk['date'][:7]}，量比{bk['vol_ratio']}x）"
+                                entry = {'類型': label, '價格': f"{v:.2f}", '距現價': f"{dist_pct:+.1f}%"}
+                                if bk['is_red']:
+                                    rows_sup.append(entry)
+                                else:
+                                    rows_res.append(entry)
+
+                            # 二分之一價
+                            hp = sr_result.get('half_price')
+                            if hp:
+                                dist_pct = (hp - cur_price) / cur_price * 100
+                                entry = {'類型': '½ 波段中間價', '價格': f"{hp:.2f}", '距現價': f"{dist_pct:+.1f}%"}
+                                if hp >= cur_price:
+                                    rows_res.append(entry)
+                                else:
+                                    rows_sup.append(entry)
+
+                            # 按距離排序（支撐由近到遠，壓力由近到遠）
+                            def dist_key(r):
+                                try:
+                                    return abs(float(r['距現價'].replace('%', '').replace('+', '')))
+                                except Exception:
+                                    return 999
+                            rows_sup.sort(key=dist_key)
+                            rows_res.sort(key=dist_key)
+
+                            # 顯示雙欄表格
+                            st.markdown(f"#### 🏷️ 支撐壓力價格一覽（現價：**{cur_price:.2f}**）")
+                            col_sup, col_res = st.columns(2)
+
+                            with col_sup:
+                                st.markdown("**🟢 支撐位（由近到遠）**")
+                                if rows_sup:
+                                    import pandas as _pd2
+                                    df_sup = _pd2.DataFrame(rows_sup)
+                                    st.dataframe(
+                                        df_sup,
+                                        use_container_width=True,
+                                        hide_index=True,
+                                        column_config={
+                                            '類型': st.column_config.TextColumn('來源', width='medium'),
+                                            '價格': st.column_config.TextColumn('價格', width='small'),
+                                            '距現價': st.column_config.TextColumn('距現價', width='small'),
+                                        }
+                                    )
+                                else:
+                                    st.caption("無支撐位資料")
+
+                            with col_res:
+                                st.markdown("**🔴 壓力位（由近到遠）**")
+                                if rows_res:
+                                    import pandas as _pd2
+                                    df_res = _pd2.DataFrame(rows_res)
+                                    st.dataframe(
+                                        df_res,
+                                        use_container_width=True,
+                                        hide_index=True,
+                                        column_config={
+                                            '類型': st.column_config.TextColumn('來源', width='medium'),
+                                            '價格': st.column_config.TextColumn('價格', width='small'),
+                                            '距現價': st.column_config.TextColumn('距現價', width='small'),
+                                        }
+                                    )
+                                else:
+                                    st.caption("無壓力位資料")
+
+                            st.caption(
+                                "⚠️ 支撐壓力為技術面自動計算，依朱家泓切線系統七大來源。"
+                                "「距現價」正值＝在現價上方（壓力），負值＝在現價下方（支撐）。"
+                            )
+
                     # ── 顯示 4（台股）：融資融券 ──
                     if is_tw and margin_df is not None and len(margin_df) > 0:
                         margin_chart = create_margin_chart(margin_df, symbol.strip())
