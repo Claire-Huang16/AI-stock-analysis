@@ -5239,7 +5239,7 @@ def generate_stock_evaluation(symbol, stock_data, openai_api_key, market='us',
         def _f(v, fmt=".2f"): return format(v, fmt) if v is not None else "N/A"
         def _chg_str(chg): return (("增加" if chg>0 else "減少") + str(abs(int(chg))) + "張") if chg is not None else ""
 
-        # ── 組裝數值摘要文字 ──
+        # ── 組裝數值摘要文字（精簡版，節省 token 讓 AI 有足夠空間輸出完整 JSON）──
         lines_list = [
             f"【股票代碼】{symbol}（{market_desc}）　收盤：{currency}{_f(close)}",
             "",
@@ -5247,59 +5247,49 @@ def generate_stock_evaluation(symbol, stock_data, openai_api_key, market='us',
             recent5_str,
             "",
             "【日線均線】",
-            f"MA5={_f(ma5)}（前{_f(ma5p)}）  MA10={_f(ma10)}（前{_f(ma10p)}）  MA20={_f(ma20)}（前{_f(ma20p)}）  MA60={_f(ma60)}（前{_f(ma60p)}）",
-            f"布林上軌={_f(bb_u)}  中軌={_f(bb_m)}  下軌={_f(bb_l)}",
-            f"收盤位置：{'高於' if ma5 and close>ma5 else '低於'}MA5  {'高於' if ma20 and close>ma20 else '低於'}MA20  {'高於' if ma60 and close>ma60 else '低於'}MA60",
+            f"MA5={_f(ma5)}  MA10={_f(ma10)}  MA20={_f(ma20)}  MA60={_f(ma60)}",
+            f"布林：上軌={_f(bb_u)}  中軌={_f(bb_m)}  下軌={_f(bb_l)}",
+            f"位置：{'高於' if ma5 and close>ma5 else '低於'}MA5  {'高於' if ma20 and close>ma20 else '低於'}MA20  {'高於' if ma60 and close>ma60 else '低於'}MA60",
             "",
             "【日線成交量】",
-            f"今日={int(vol_today)}　前日={int(vol_prev)}　5日均={int(vol_5avg)}　20日均={int(vol_20avg)}　量比={vol_today/vol_20avg:.2f}倍",
+            f"今={int(vol_today)}  昨={int(vol_prev)}  5日均={int(vol_5avg)}  20日均={int(vol_20avg)}  量比={vol_today/vol_20avg:.2f}x",
             "",
-            "【日線MACD(12,26,9)】",
-            f"DIF={_f(macd_dif,'.4f')}（前{_f(macd_dif_p,'.4f')}）  SIGNAL={_f(macd_line,'.4f')}（前{_f(macd_line_p,'.4f')}）  HIST={_f(macd_hist,'.4f')}（前{_f(macd_hist_p,'.4f')}）",
-            f"DIF在零軸{'上方' if macd_dif and macd_dif>0 else '下方'}　HIST{'擴大' if macd_hist and macd_hist_p and abs(macd_hist)>abs(macd_hist_p) else '縮小'}中",
+            "【日線MACD】",
+            f"DIF={_f(macd_dif,'.4f')}  SIGNAL={_f(macd_line,'.4f')}  HIST={_f(macd_hist,'.4f')}",
+            f"DIF在零軸{'上' if macd_dif and macd_dif>0 else '下'}  HIST{'擴大' if macd_hist and macd_hist_p and abs(macd_hist)>abs(macd_hist_p) else '縮小'}",
             "",
-            "【日線KD(9)】",
-            f"K={_f(kd_k,'.1f')}（前{_f(kd_k_p,'.1f')}）  D={_f(kd_d,'.1f')}（前{_f(kd_d_p,'.1f')}）" +
-            (" ⭐近5日KD金叉" if kd_golden else "") + (" ⚠️近5日KD死叉" if kd_dead else "") +
-            (" 【高檔鈍化K>80】" if kd_k and kd_k>80 else " 【低檔鈍化K<20】" if kd_k and kd_k<20 else ""),
+            "【日線KD】",
+            f"K={_f(kd_k,'.1f')}  D={_f(kd_d,'.1f')}" +
+            ("  ⭐近5日KD金叉" if kd_golden else "") + ("  ⚠️近5日KD死叉" if kd_dead else "") +
+            ("  【K>80高鈍化】" if kd_k and kd_k>80 else "  【K<20低鈍化】" if kd_k and kd_k<20 else ""),
             f"RSI({rsi_period})={_f(rsi_val,'.2f')}",
-            "",
-            "【近3週K線】",
-            w_recent3,
-            "",
-            "【週線均線】",
-            f"週收={_f(w_close)}  週MA5={_f(w_ma5)}  週MA10={_f(w_ma10)}  週MA20={_f(w_ma20)}  週MA60={_f(w_ma60)}",
-            f"週收 vs 週均：{'高於' if w_close and w_ma20 and w_close>w_ma20 else '低於'}週MA20  {'高於' if w_close and w_ma60 and w_close>w_ma60 else '低於'}週MA60",
-            "",
-            "【週線MACD】",
-            f"DIF={_f(w_macd_dif,'.4f')}（前{_f(w_macd_dif_p,'.4f')}）  SIGNAL={_f(w_macd_line,'.4f')}（前{_f(w_macd_line_p,'.4f')}）  HIST={_f(w_macd_hist,'.4f')}",
-            "",
-            "【週線KD】",
-            f"K={_f(w_kd_k,'.1f')}（前{_f(w_kd_k_p,'.1f')}）  D={_f(w_kd_d,'.1f')}（前{_f(w_kd_d_p,'.1f')}）",
-            "",
-            f"【近60日高低】最高={_f(month_high)}　最低={_f(month_low)}",
+            f"【近60日高低】最高={_f(month_high)}  最低={_f(month_low)}",
         ]
+
+        # 週線（只保留關鍵數值）
+        if weekly_df is not None and len(weekly_df) >= 2:
+            lines_list += [
+                "",
+                "【週線關鍵數值】",
+                f"週收={_f(w_close)}  週MA20={_f(w_ma20)}  週MA60={_f(w_ma60)}",
+                f"週KD：K={_f(w_kd_k,'.1f')}  D={_f(w_kd_d,'.1f')}",
+                f"週MACD：DIF={_f(w_macd_dif,'.4f')}  HIST={_f(w_macd_hist,'.4f')}",
+            ]
 
         if mg_rem is not None:
             lines_list += [
                 "",
-                "【融資融券（台股）】",
-                f"融資餘額={int(mg_rem)}張（{_chg_str(mg_chg)}）　融資買進={int(mg_buy) if mg_buy else 'N/A'}張　融資賣出={int(mg_sell) if mg_sell else 'N/A'}張",
-                f"融券餘額={int(ss_rem) if ss_rem else 'N/A'}張（{_chg_str(ss_chg)}）　融券賣出={int(ss_sell) if ss_sell else 'N/A'}張　融券回補={int(ss_buy) if ss_buy else 'N/A'}張",
-                f"融資比率={_f(mg_ratio,'.2f') if mg_ratio else 'N/A'}%",
+                "【融資融券】",
+                f"融資餘額={int(mg_rem)}張（{_chg_str(mg_chg)}）  融券餘額={int(ss_rem) if ss_rem else 'N/A'}張（{_chg_str(ss_chg)}）  融資比率={_f(mg_ratio,'.2f') if mg_ratio else 'N/A'}%",
             ]
         if inst_lines:
-            lines_list += ["", "【三大法人（台股）】"] + inst_lines
-        if zhu_str:  lines_list += ["", zhu_str]
-        if bull_str: lines_list.append(bull_str)
-        if kline_str: lines_list.append(kline_str)
-        if mnemonics_result and mnemonics_result.get('triggered'):
-            m_summary = mnemonics_result.get('summary', '')
-            m_bull = '、'.join([f"口訣{t['num']}" for t in mnemonics_result['triggered'] if t['direction']=='bull'])
-            m_bear = '、'.join([f"口訣{t['num']}" for t in mnemonics_result['triggered'] if t['direction']=='bear'])
-            lines_list.append(f"\n【朱家泓12口訣辨識】{m_summary}")
-            if m_bull: lines_list.append(f"  多頭口訣：{m_bull} — " + "；".join(mnemonics_result['bull_signals']))
-            if m_bear: lines_list.append(f"  空頭口訣：{m_bear} — " + "；".join(mnemonics_result['bear_signals']))
+            lines_list += ["", "【三大法人】"] + inst_lines
+        if zhu_str:
+            lines_list += ["", zhu_str]
+        if bull_str:
+            lines_list.append(bull_str)
+        if kline_str:
+            lines_list.append(kline_str)
         if sr_result and sr_result.get('summary_text'):
             lines_list.append(f"\n{sr_result['summary_text']}")
 
@@ -5390,11 +5380,22 @@ def generate_stock_evaluation(symbol, stock_data, openai_api_key, market='us',
                 {"role": "system", "content": system_msg},
                 {"role": "user",   "content": user_msg},
             ],
-            max_tokens=1500,
+            max_tokens=2500,          # 從 1500 → 2500，避免 JSON 被截斷
             temperature=0.2
         )
         raw = response.choices[0].message.content.strip()
         raw = raw.replace("```json", "").replace("```", "").strip()
+
+        # 若 JSON 被截斷，嘗試補上結尾括號
+        if not raw.endswith("}"):
+            # 找最後一個完整的 key-value（去掉末尾不完整的行）
+            lines = raw.splitlines()
+            while lines and not lines[-1].strip().endswith(('",', '"')):
+                lines.pop()
+            if lines and lines[-1].strip().endswith('",'):
+                lines[-1] = lines[-1].rstrip().rstrip(',') + '"'
+            raw = "\n".join(lines) + "\n}"
+
         return json.loads(raw)
 
     except Exception as e:
