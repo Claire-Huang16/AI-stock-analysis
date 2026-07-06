@@ -2482,6 +2482,278 @@ def create_pivot_wave_chart(df, zhu_result, symbol, currency_symbol='NT$'):
     return fig
 
 
+# ─────────────────────────────────────────────────────────────────────────────
+# 4大金剛評分系統
+# 依朱家泓「技術分析全攻略」：趨勢 × K線 × 均線 × 成交量 = 100分
+# ≥ 50分 = 買進訊號 | < 50分 = 賣出訊號
+# ─────────────────────────────────────────────────────────────────────────────
+
+def _fk_sma(arr, period):
+    if len(arr) < period:
+        return None
+    return sum(arr[-period:]) / period
+
+
+def _fk_ema(arr, period):
+    if len(arr) < period:
+        return []
+    k = 2 / (period + 1)
+    val = sum(arr[:period]) / period
+    result = [val]
+    for v in arr[period:]:
+        val = v * k + val * (1 - k)
+        result.append(val)
+    return result
+
+
+def _fk_macd(closes, fast=12, slow=26, signal=9):
+    if len(closes) < slow + signal:
+        return None, None, None
+    ef = _fk_ema(closes, fast)
+    es = _fk_ema(closes, slow)
+    off = len(ef) - len(es)
+    dif = [ef[i + off] - v for i, v in enumerate(es)]
+    dea = _fk_ema(dif, signal)
+    dif_off = len(dif) - len(dea)
+    hist = [dif[i + dif_off] - v for i, v in enumerate(dea)]
+    return dif[-1], dea[-1], hist[-1]
+
+
+def calculate_four_kings(df) -> dict:
+    """
+    4大金剛評分（共 100 分）
+    趨勢25 + K線25 + 均線25 + 成交量25
+    直接吃 data_with_indicators DataFrame（含 MA5/MA10/MA20/MA60 欄）
+    """
+    if df is None or len(df) < 30:
+        return {"error": "資料不足"}
+
+    closes  = df['close'].values.astype(float).tolist()
+    highs   = df['high'].values.astype(float).tolist()
+    lows    = df['low'].values.astype(float).tolist()
+    opens   = df['open'].values.astype(float).tolist()
+    volumes = df['volume'].values.astype(float).tolist() if 'volume' in df.columns else [1]*len(closes)
+
+    close  = closes[-1]
+    prev   = closes[-2]
+    open_  = opens[-1]
+
+    # 優先用已計算好的均線欄位
+    def _col(col): return float(df[col].iloc[-1]) if col in df.columns and not df[col].isna().iloc[-1] else None
+    ma5  = _col('MA5')  or _fk_sma(closes, 5)
+    ma10 = _col('MA10') or _fk_sma(closes, 10)
+    ma20 = _col('MA20') or _fk_sma(closes, 20)
+    ma60 = _col('MA60') or (_fk_sma(closes, 60) if len(closes) >= 60 else None)
+
+    vol_today = volumes[-1]
+    vol_20avg = sum(volumes[-20:]) / min(20, len(volumes))
+    vol_ratio = vol_today / vol_20avg if vol_20avg > 0 else 1.0
+
+    # 優先用已有 MACD 欄
+    if 'MACD_DIF' in df.columns and 'MACD_HIST' in df.columns:
+        dif  = float(df['MACD_DIF'].iloc[-1])  if not df['MACD_DIF'].isna().iloc[-1]  else None
+        hist = float(df['MACD_HIST'].iloc[-1]) if not df['MACD_HIST'].isna().iloc[-1] else None
+    else:
+        dif, _, hist = _fk_macd(closes)
+
+    look = min(60, len(closes))
+    recent_high = max(highs[-look:])
+    recent_low  = min(lows[-look:])
+    rel_pos = (close - recent_low) / (recent_high - recent_low + 1e-9)
+
+    chg_pct = (close - prev) / prev if prev > 0 else 0
+    is_red  = close >= open_
+
+    def add(items, label, pts, max_pts, desc):
+        items.append({"項目": label, "得分": pts, "滿分": max_pts, "說明": desc})
+        return pts
+
+    # ── ① 趨勢 ──────────────────────────────────────────────────────────────
+    t_items, t_score = [], 0
+    above60 = ma60 is not None and close > ma60
+    above20 = ma20 is not None and close > ma20
+    t_pos = 8 if above60 and above20 else 5 if above20 else 3 if above60 else 0
+    t_score += add(t_items, "收盤在 MA20/MA60 上方", t_pos, 8,
+        "收>MA20且>MA60" if (above60 and above20) else "收>MA20" if above20
+        else "收>MA60" if above60 else "收在均線下方")
+
+    t_macd = 0
+    if dif is not None:
+        if dif > 0 and hist and hist > 0:   t_macd = 9
+        elif dif > 0:                        t_macd = 6
+        elif hist and hist > 0:             t_macd = 4
+    t_score += add(t_items, "MACD趨勢（DIF+Hist）", t_macd, 9,
+        f"DIF={dif:.3f} HIST={hist:.3f}" if dif is not None else "無資料")
+
+    t_wave = 8 if rel_pos >= 0.7 else 6 if rel_pos >= 0.5 else 3 if rel_pos >= 0.3 else 1
+    t_score += add(t_items, "波段相對位置", t_wave, 8,
+        f"{'高位' if rel_pos>=0.7 else '中高位' if rel_pos>=0.5 else '中低位' if rel_pos>=0.3 else '低位'} {rel_pos*100:.0f}%")
+
+    # ── ② K線 ───────────────────────────────────────────────────────────────
+    k_items, k_score = [], 0
+    k_dir = 10 if close > prev else 4 if close == prev else 0
+    k_score += add(k_items, "K線方向（紅/黑）", k_dir, 10,
+        f"{'紅K' if close>prev else '平盤' if close==prev else '黑K'}（{chg_pct*100:+.2f}%）")
+
+    k_body = (8 if is_red and chg_pct >= 0.03 else 6 if is_red and chg_pct >= 0.01
+              else 4 if is_red else 0 if chg_pct <= -0.03 else 2 if chg_pct <= -0.01 else 3)
+    k_score += add(k_items, "實體強弱", k_body, 8, f"{chg_pct*100:+.2f}%")
+
+    k_vol = (7 if vol_ratio >= 2.0 and is_red else 5 if vol_ratio >= 1.5 and is_red
+             else 0 if vol_ratio >= 2.0 else 1 if vol_ratio >= 1.5 and not is_red
+             else 4 if is_red else 2)
+    k_score += add(k_items, "量價K線配合", k_vol, 7,
+        f"{'爆量長紅' if vol_ratio>=2 and is_red else '爆量黑K⚠️' if vol_ratio>=2 else '放量紅' if vol_ratio>=1.5 and is_red else '放量黑⚠️' if vol_ratio>=1.5 else '紅K' if is_red else '黑K'} 量比{vol_ratio:.1f}x")
+
+    # ── ③ 均線 ──────────────────────────────────────────────────────────────
+    m_items, m_score = [], 0
+    for lbl, ok, val in [
+        ("收盤 > MA5",   ma5  is not None and close > ma5,  ma5),
+        ("MA5 > MA10",  ma5  is not None and ma10 is not None and ma5  > ma10, None),
+        ("MA10 > MA20", ma10 is not None and ma20 is not None and ma10 > ma20, None),
+        ("MA20 > MA60", ma20 is not None and ma60 is not None and ma20 > ma60, None),
+        ("收盤 > MA20",  ma20 is not None and close > ma20, ma20),
+    ]:
+        pts = 5 if ok else 0
+        m_score += add(m_items, lbl, pts, 5,
+            f"{'✓' if ok else '✗'}{'（'+str(round(val,2))+'）' if val else ''}")
+
+    # ── ④ 成交量 ────────────────────────────────────────────────────────────
+    v_items, v_score = [], 0
+    v_ratio_pts = (15 if vol_ratio>=3 else 12 if vol_ratio>=2 else 9 if vol_ratio>=1.5
+                   else 6 if vol_ratio>=1 else 3 if vol_ratio>=0.7 else 1)
+    v_score += add(v_items, f"量比（{vol_ratio:.2f}x）", v_ratio_pts, 15,
+        f"今={int(vol_today/1000)}K  20日均={int(vol_20avg/1000)}K")
+
+    v_match = (10 if vol_ratio>=1.2 and is_red else 8 if vol_ratio<0.8 and not is_red
+               else 5 if vol_ratio<0.8 and is_red else 0 if vol_ratio>=1.2 and not is_red else 4)
+    v_score += add(v_items, "量價配合", v_match, 10,
+        "放量上漲✓" if vol_ratio>=1.2 and is_red else "縮量下跌（正常回檔）" if vol_ratio<0.8 and not is_red
+        else "縮量上漲（偏弱）" if vol_ratio<0.8 else "放量下跌⚠️出貨警訊" if vol_ratio>=1.2 and not is_red else "量價中性")
+
+    total = t_score + k_score + m_score + v_score
+    return {
+        "total":   total,
+        "verdict": "買進" if total >= 50 else "賣出",
+        "trend":   {"score": t_score, "max": 25, "items": t_items},
+        "kline":   {"score": k_score, "max": 25, "items": k_items},
+        "ma":      {"score": m_score, "max": 25, "items": m_items},
+        "vol":     {"score": v_score, "max": 25, "items": v_items},
+        "close":   close,
+        "vol_ratio": vol_ratio,
+    }
+
+
+def display_four_kings_dashboard(fk_result: dict, symbol: str):
+    """顯示4大金剛評分儀表板，緊接在朱家泓口訣之後（顯示 11d）"""
+    if not fk_result or "error" in fk_result:
+        return
+
+    st.markdown("---")
+    st.markdown("### 🏆 4大金剛評分")
+    st.caption("依朱家泓「技術分析全攻略」框架：趨勢 × K線 × 均線 × 成交量　｜　≥ 50分 買進 / < 50分 賣出")
+
+    total   = fk_result["total"]
+    verdict = fk_result["verdict"]
+    is_buy  = verdict == "買進"
+    verdict_color = "#2ecc71" if is_buy else "#e74c3c"
+
+    # ── 總分橫幅 ──────────────────────────────────────────────────────────
+    col_score, col_verdict = st.columns([1, 2])
+
+    with col_score:
+        bar_color = "#2ecc71" if total >= 70 else "#f9ca24" if total >= 50 else "#e74c3c"
+        st.markdown(f"""
+<div style="background:linear-gradient(135deg,#1a1a2e,#16213e);border-radius:16px;
+  padding:20px;text-align:center;border:2px solid {verdict_color};">
+  <div style="font-size:13px;color:#aaa;margin-bottom:4px">4大金剛總分</div>
+  <div style="font-size:56px;font-weight:900;color:{verdict_color};line-height:1">{total}</div>
+  <div style="font-size:12px;color:#777">/ 100 分</div>
+  <div style="margin-top:10px;background:rgba(255,255,255,0.1);border-radius:6px;height:8px;position:relative">
+    <div style="position:absolute;left:50%;top:-2px;width:2px;height:12px;background:rgba(255,255,255,0.3)"></div>
+    <div style="background:{bar_color};width:{total}%;height:8px;border-radius:6px"></div>
+  </div>
+  <div style="margin-top:6px;font-size:11px;color:#555;display:flex;justify-content:space-between">
+    <span>0</span><span>50分水嶺</span><span>100</span>
+  </div>
+</div>""", unsafe_allow_html=True)
+
+    with col_verdict:
+        st.markdown(f"""
+<div style="background:linear-gradient(135deg,#1a1a2e,#16213e);border-radius:16px;
+  padding:20px;border:2px solid {verdict_color};height:100%">
+  <div style="font-size:13px;color:#aaa;margin-bottom:10px">📍 交易訊號</div>
+  <div style="font-size:32px;font-weight:700;color:{verdict_color};margin-bottom:12px">
+    {'📈 買進訊號' if is_buy else '📉 賣出訊號'}
+  </div>
+  <div style="font-size:13px;color:#ddd;margin-bottom:4px">
+    收盤：<b>{fk_result['close']:.2f}</b>　量比：<b>{fk_result['vol_ratio']:.2f}x</b>
+  </div>
+  <div style="font-size:12px;color:#888">
+    {'≥50分進場參考，結合趨勢與量能判斷' if is_buy else '<50分出場參考，量縮或跌破均線留意風險'}
+  </div>
+</div>""", unsafe_allow_html=True)
+
+    st.markdown("<div style='margin-top:16px'></div>", unsafe_allow_html=True)
+
+    # ── 四項分數卡（2×2）────────────────────────────────────────────────
+    def section_card(title, icon, data):
+        s, mx = data["score"], data["max"]
+        pct = s / mx * 100
+        bar_c = "#2ecc71" if pct >= 70 else "#f9ca24" if pct >= 40 else "#e74c3c"
+        items_html = "".join(
+            f'<div style="display:flex;justify-content:space-between;font-size:11.5px;'
+            f'padding:4px 0;border-top:0.5px solid rgba(255,255,255,0.07)">'
+            f'<span style="color:#bbb">{"🟢" if it["得分"]==it["滿分"] else "🟡" if it["得分"]>0 else "🔴"} '
+            f'{it["項目"]}</span>'
+            f'<span style="font-family:monospace;font-size:11px;color:#eee">{it["得分"]}/{it["滿分"]}'
+            f'<span style="color:#777;font-size:10.5px"> {it["說明"]}</span></span></div>'
+            for it in data["items"]
+        )
+        return f"""
+<div style="background:linear-gradient(135deg,#1a1a2e,#16213e);border-radius:12px;
+  padding:14px 16px;border:0.5px solid rgba(255,255,255,0.1)">
+  <div style="display:flex;justify-content:space-between;align-items:baseline;margin-bottom:8px">
+    <span style="font-size:14px;font-weight:600">{icon} {title}</span>
+    <span style="font-size:22px;font-weight:700;font-family:monospace;color:{bar_c}">{s}<span style="font-size:12px;color:#666"> / {mx}</span></span>
+  </div>
+  <div style="background:rgba(255,255,255,0.1);border-radius:4px;height:5px;margin-bottom:10px">
+    <div style="background:{bar_c};width:{pct:.0f}%;height:5px;border-radius:4px"></div>
+  </div>
+  {items_html}
+</div>"""
+
+    c1, c2 = st.columns(2)
+    with c1:
+        st.markdown(section_card("趨勢", "📈", fk_result["trend"]), unsafe_allow_html=True)
+        st.markdown("<div style='margin-top:8px'></div>", unsafe_allow_html=True)
+        st.markdown(section_card("均線", "〰️", fk_result["ma"]), unsafe_allow_html=True)
+    with c2:
+        st.markdown(section_card("K線", "🕯", fk_result["kline"]), unsafe_allow_html=True)
+        st.markdown("<div style='margin-top:8px'></div>", unsafe_allow_html=True)
+        st.markdown(section_card("成交量", "📊", fk_result["vol"]), unsafe_allow_html=True)
+
+    with st.expander("📖 4大金剛評分規則說明", expanded=False):
+        st.markdown("""
+| 大項 | 滿分 | 評分邏輯 |
+|------|------|---------|
+| ① 趨勢 | 25 | 收盤在MA20/MA60上方(8) + MACD DIF/Hist方向(9) + 波段相對位置(8) |
+| ② K線 | 25 | 紅/黑方向(10) + 漲跌幅強弱(8) + 量價K線配合(7) |
+| ③ 均線 | 25 | 收>MA5(5) + MA5>MA10(5) + MA10>MA20(5) + MA20>MA60(5) + 收>MA20(5) |
+| ④ 成交量 | 25 | 量比倍數(15) + 量價配合（放量漲/縮量跌為正面）(10) |
+
+**⚠️ 特別保護：** 爆量黑K（出貨訊號）→ K線量價配合得0分；放量下跌 → 成交量配合得0分
+
+**判斷標準：**
+- 🟢 **≥ 70分**：強勢買進訊號，多頭全面啟動
+- 🟢 **50–69分**：買進訊號，建議分批進場
+- 🔴 **30–49分**：賣出訊號，觀望或減碼
+- 🔴 **< 30分**：強勢賣出，空頭格局留意風險
+
+⚠️ 以上為技術面參考，不構成投資建議，請依個人財務狀況審慎評估。
+        """)
+
+
 def display_zhu_trend_dashboard(zhu_result, symbol, currency_symbol='$'):
     """
     顯示朱家泓趨勢線系統的分析儀表板。
@@ -6291,6 +6563,7 @@ if analyze_button:
                 zhu_result       = calculate_zhu_trend_system(data_with_indicators)
                 kline_result     = calculate_kline_pattern_system(data_with_indicators)
                 mnemonics_result = calculate_zhu_mnemonics(data_with_indicators)
+                four_kings_result = calculate_four_kings(data_with_indicators)
 
                 # ── Step 5b: 朱家泓切線系統 支撐壓力自動計算 ──
                 with st.spinner("計算切線系統支撐壓力（朱家泓第5–6章）..."):
@@ -7436,6 +7709,12 @@ if analyze_button:
                     # ── 顯示 11c：朱家泓12口訣辨識 ──
                     display_zhu_mnemonics_dashboard(
                         mnemonics_result,
+                        symbol.strip() if is_tw else symbol.upper()
+                    )
+
+                    # ── 顯示 11d：4大金剛評分 ──
+                    display_four_kings_dashboard(
+                        four_kings_result,
                         symbol.strip() if is_tw else symbol.upper()
                     )
 
