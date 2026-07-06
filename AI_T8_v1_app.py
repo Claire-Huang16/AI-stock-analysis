@@ -5121,7 +5121,11 @@ def generate_stock_evaluation(symbol, stock_data, openai_api_key, market='us',
         d = stock_data
         # ── 近5根日K線 ──
         recent5 = d.tail(5)[['date','open','high','low','close','volume']].copy()
-        recent5['date'] = recent5['date'].dt.strftime('%Y-%m-%d')
+        # 安全地轉換日期格式（date 欄可能是 datetime 或字串）
+        try:
+            recent5['date'] = pd.to_datetime(recent5['date']).dt.strftime('%Y-%m-%d')
+        except Exception:
+            recent5['date'] = recent5['date'].astype(str).str[:10]
         recent5_str = recent5.to_string(index=False)
 
         close      = float(d['close'].iloc[-1])
@@ -5165,7 +5169,10 @@ def generate_stock_evaluation(symbol, stock_data, openai_api_key, market='us',
             w_kd_k=_wv('KD_K'); w_kd_d=_wv('KD_D'); w_kd_k_p=_wv2('KD_K'); w_kd_d_p=_wv2('KD_D')
             w_vol=_wv('volume'); w_vol_prev=_wv2('volume')
             wr3 = weekly_df.tail(3)[['date','open','high','low','close','volume']].copy()
-            wr3['date'] = pd.to_datetime(wr3['date']).dt.strftime('%Y-%m-%d')
+            try:
+                wr3['date'] = pd.to_datetime(wr3['date']).dt.strftime('%Y-%m-%d')
+            except Exception:
+                wr3['date'] = wr3['date'].astype(str).str[:10]
             w_recent3 = wr3.to_string(index=False)
 
         # ── 融資融券 ──
@@ -7564,31 +7571,45 @@ if analyze_button:
 
                     # 每次分析自動 AI 填入（以「股票+小時」作為快取鍵，避免重複呼叫）
                     _ts_now = f"{_eval_symbol}_{datetime.now().strftime('%Y%m%d%H')}"
-                    if st.session_state.get("last_eval_ts") != _ts_now or not st.session_state.get(_eval_key):
-                        _ai_result = generate_stock_evaluation(
-                            symbol=_eval_symbol,
-                            stock_data=data_with_indicators,
-                            openai_api_key=openai_api_key,
-                            market=market_key,
-                            zhu_result=zhu_result,
-                            bull_signals=bull_signals,
-                            kline_result=kline_result,
-                            mnemonics_result=mnemonics_result,
-                            sr_result=sr_result,
-                            rsi_period=rsi_period,
-                            institutional_df=institutional_df if is_tw else None,
-                            margin_df=margin_df if is_tw else None,
-                            weekly_df=weekly_df if 'weekly_df' in dir() else None,
-                            financial_data=financial_data if is_tw else None,
-                            analyst_data=analyst_data,
-                            insider_df=insider_df,
-                            director_df=director_df if is_tw else None,
-                        )
+                    _need_call = (
+                        st.session_state.get("last_eval_ts") != _ts_now
+                        or not st.session_state.get(_eval_key)
+                    )
+                    if _need_call:
+                        with st.spinner("AI 正在填入選股評量表格..."):
+                            _ai_result = generate_stock_evaluation(
+                                symbol=_eval_symbol,
+                                stock_data=data_with_indicators,
+                                openai_api_key=openai_api_key,
+                                market=market_key,
+                                zhu_result=zhu_result,
+                                bull_signals=bull_signals,
+                                kline_result=kline_result,
+                                mnemonics_result=mnemonics_result,
+                                sr_result=sr_result,
+                                rsi_period=rsi_period,
+                                institutional_df=institutional_df if is_tw else None,
+                                margin_df=margin_df if is_tw else None,
+                                weekly_df=weekly_df if 'weekly_df' in dir() else None,
+                                financial_data=financial_data if is_tw else None,
+                                analyst_data=analyst_data,
+                                insider_df=insider_df,
+                                director_df=director_df if is_tw else None,
+                            )
                         if "_error" not in _ai_result:
                             st.session_state[_eval_key] = _ai_result
                             st.session_state["last_eval_ts"] = _ts_now
                         else:
-                            st.session_state.setdefault(_eval_key, {})
+                            _err_msg = _ai_result.get("_error", "未知錯誤")
+                            st.error(f"⚠️ 選股評量表格 AI 填入失敗：{_err_msg}")
+                            if not st.session_state.get(_eval_key):
+                                st.session_state[_eval_key] = {}
+
+                    # 手動重新填入按鈕
+                    if st.button("🔄 重新 AI 填入評量表格", key=f"retry_eval_{_eval_symbol}"):
+                        st.session_state.pop(_eval_key, None)
+                        st.session_state.pop("last_eval_ts", None)
+                        st.rerun()
 
                     with st.expander("📝 選股評量表格（點擊展開／收合）", expanded=True):
                         # 標題資訊列
