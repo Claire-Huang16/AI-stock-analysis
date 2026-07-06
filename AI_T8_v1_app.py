@@ -2140,6 +2140,10 @@ def calculate_zhu_trend_system(df):
 
         result['detail']['bull_wave'] = bull_wave
         result['detail']['bear_wave'] = bear_wave
+        # 儲存轉折點座標供圖表使用
+        result['detail']['local_highs'] = local_highs  # list of (offset_i, value)
+        result['detail']['local_lows']  = local_lows
+        result['detail']['pivot_window'] = window       # 對應 df 末尾幾根
 
         if bull_wave:
             add_item('轉折波方向', 15, 15, 'green',  wave_desc)
@@ -2343,6 +2347,139 @@ def calculate_zhu_trend_system(df):
         result['action_label'] = '🔴 出場（多轉空訊號，優先出場）'
 
     return result
+
+
+def create_pivot_wave_chart(df, zhu_result, symbol, currency_symbol='NT$'):
+    """
+    依朱家泓《趨勢線》教材繪製轉折波圖：
+    - 底色 K 線（紅漲綠跌）
+    - 自動偵測的局部高點標「頭」、低點標「底」
+    - 折線連接相鄰高點與低點，顯示頭頭高/底底高或頭頭低/底底低走勢
+    - 標注最新高低點的價位
+    """
+    if df is None or zhu_result is None:
+        return None
+
+    detail = zhu_result.get('detail', {})
+    local_highs = detail.get('local_highs', [])
+    local_lows  = detail.get('local_lows', [])
+    pivot_window = detail.get('pivot_window', min(40, len(df)))
+    bull_wave = detail.get('bull_wave', False)
+    bear_wave = detail.get('bear_wave', False)
+
+    # 取對應的 df 切片（末尾 pivot_window 根）
+    df_sub = df.tail(pivot_window).reset_index(drop=True)
+    n_sub  = len(df_sub)
+    dates  = df_sub['date'].astype(str).str[:10].tolist()
+
+    # 將 offset index 轉換為 df_sub 的日期
+    def idx_to_date(i):
+        i = max(0, min(i, n_sub - 1))
+        return dates[i]
+
+    # 確認方向色
+    wave_color = '#2ecc71' if bull_wave else ('#e74c3c' if bear_wave else '#f9ca24')
+    title_suffix = '🟢 多頭轉折波（頭頭高底底高）' if bull_wave else ('🔴 空頭轉折波（頭頭低底底低）' if bear_wave else '⚪ 轉折波方向不明')
+
+    fig = go.Figure()
+
+    # ── K 線 ──
+    fig.add_trace(go.Candlestick(
+        x=dates,
+        open=df_sub['open'], high=df_sub['high'],
+        low=df_sub['low'],  close=df_sub['close'],
+        increasing=dict(line=dict(color='#e74c3c', width=1), fillcolor='#e74c3c'),
+        decreasing=dict(line=dict(color='#2ecc71', width=1), fillcolor='#2ecc71'),
+        name='K線', showlegend=False,
+    ))
+
+    # ── 高點折線（頭）──
+    if local_highs:
+        h_dates = [idx_to_date(i) for i, _ in local_highs]
+        h_vals  = [v for _, v in local_highs]
+        fig.add_trace(go.Scatter(
+            x=h_dates, y=h_vals, mode='lines+markers+text',
+            line=dict(color='#e74c3c', width=1.5, dash='dot'),
+            marker=dict(symbol='triangle-down', size=10, color='#e74c3c'),
+            text=[f'頭<br>{v:.2f}' for v in h_vals],
+            textposition='top center',
+            textfont=dict(size=10, color='#e74c3c'),
+            name='轉折高點（頭）',
+            showlegend=True,
+        ))
+
+    # ── 低點折線（底）──
+    if local_lows:
+        l_dates = [idx_to_date(i) for i, _ in local_lows]
+        l_vals  = [v for _, v in local_lows]
+        fig.add_trace(go.Scatter(
+            x=l_dates, y=l_vals, mode='lines+markers+text',
+            line=dict(color='#2ecc71', width=1.5, dash='dot'),
+            marker=dict(symbol='triangle-up', size=10, color='#2ecc71'),
+            text=[f'底<br>{v:.2f}' for v in l_vals],
+            textposition='bottom center',
+            textfont=dict(size=10, color='#2ecc71'),
+            name='轉折低點（底）',
+            showlegend=True,
+        ))
+
+    # ── 最新高低點標注（右側數字）──
+    if local_highs:
+        last_h_date, last_h_val = idx_to_date(local_highs[-1][0]), local_highs[-1][1]
+        fig.add_annotation(
+            x=last_h_date, y=last_h_val,
+            text=f'最新頭 {last_h_val:.2f}',
+            showarrow=True, arrowhead=2, arrowcolor='#e74c3c', arrowsize=1.2,
+            ax=30, ay=-30,
+            font=dict(size=11, color='#e74c3c'),
+            bgcolor='rgba(255,255,255,0.85)', bordercolor='#e74c3c', borderwidth=1,
+        )
+    if local_lows:
+        last_l_date, last_l_val = idx_to_date(local_lows[-1][0]), local_lows[-1][1]
+        fig.add_annotation(
+            x=last_l_date, y=last_l_val,
+            text=f'最新底 {last_l_val:.2f}',
+            showarrow=True, arrowhead=2, arrowcolor='#2ecc71', arrowsize=1.2,
+            ax=30, ay=30,
+            font=dict(size=11, color='#2ecc71'),
+            bgcolor='rgba(255,255,255,0.85)', bordercolor='#2ecc71', borderwidth=1,
+        )
+
+    # ── 方向說明帶 ──
+    if bull_wave:
+        desc_text = '頭頭高 + 底底高 → 多頭轉折波，每次回檔低點越來越高，每次反彈高點越來越高'
+    elif bear_wave:
+        desc_text = '頭頭低 + 底底低 → 空頭轉折波，每次反彈高點越來越低，每次跌落低點越來越低'
+    else:
+        desc_text = '轉折波方向尚不明確，需觀察後續轉折點確立趨勢'
+
+    fig.update_layout(
+        title=dict(
+            text=f'📐 {symbol} 轉折波分析 — {title_suffix}',
+            font=dict(size=14), x=0, xanchor='left',
+        ),
+        height=420,
+        showlegend=True,
+        legend=dict(orientation='h', yanchor='bottom', y=1.01, xanchor='left', x=0),
+        template='plotly_white',
+        xaxis_rangeslider_visible=False,
+        yaxis_title=f'價格（{currency_symbol}）',
+        plot_bgcolor='#fafafa',
+        margin=dict(l=60, r=60, t=80, b=40),
+        annotations=[
+            # 底部說明欄
+            dict(
+                text=f'<b>朱家泓轉折波法則：</b>{desc_text}',
+                xref='paper', yref='paper', x=0, y=-0.12,
+                xanchor='left', yanchor='top',
+                showarrow=False,
+                font=dict(size=11, color='#555'),
+                bgcolor='rgba(250,250,250,0.9)',
+            ),
+        ] + (list(fig.layout.annotations) if fig.layout.annotations else []),
+    )
+
+    return fig
 
 
 def display_zhu_trend_dashboard(zhu_result, symbol, currency_symbol='$'):
@@ -7266,6 +7403,21 @@ if analyze_button:
                         symbol.strip() if is_tw else symbol.upper(),
                         currency_symbol=currency_symbol
                     )
+
+                    # ── 顯示 11a：轉折波圖（頭與底標注）──
+                    _pivot_chart = create_pivot_wave_chart(
+                        data_with_indicators,
+                        zhu_result,
+                        symbol.strip() if is_tw else symbol.upper(),
+                        currency_symbol=currency_symbol,
+                    )
+                    if _pivot_chart:
+                        st.markdown("#### 📐 轉折波圖（近40根K線）")
+                        st.caption(
+                            "朱家泓《趨勢線》教材：轉折高點（頭）以紅色▼標示，"
+                            "轉折低點（底）以綠色▲標示，折線連接顯示頭頭高/底底高趨勢"
+                        )
+                        st.plotly_chart(_pivot_chart, use_container_width=True)
 
                     # ── 顯示 11b：K線型態分析系統 ──
                     display_kline_pattern_dashboard(
